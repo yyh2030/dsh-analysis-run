@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Analysis Pipeline",
+    "description": "From DDT raw files to publication tables: ingest, AUC/k, merge, descriptives and ANCOVA, with a data fingerprint per run."
+  }
+}
