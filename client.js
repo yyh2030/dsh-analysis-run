@@ -279,7 +279,15 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'ar-top-right' },
             busy ? h('span', { className: 'ar-note' }, h('span', { className: 'ar-spin' }), ' ', STAGE_SHORT[busy] || busy, ' 运行中…') : null,
-            h('button', { className: 'ar-btn ar-btn-ghost', disabled: Boolean(busy), onClick: () => load(activeRun) }, '刷新'),
+            h('button', {
+              className: 'ar-btn ar-btn-ghost',
+              disabled: Boolean(busy),
+              onClick: () => {
+                // 手动删掉过旧 run 时，刷新要落到还存在的最近一次
+                const known = status && status.runs.some(run => run.runId === activeRun)
+                load(known ? activeRun : '')
+              }
+            }, '刷新'),
             h('button', {
               className: 'ar-btn ar-btn-outline',
               disabled: Boolean(busy),
