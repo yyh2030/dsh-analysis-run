@@ -480,6 +480,17 @@ ANOVA_LABEL = {
 }
 
 
+def _rounded(value, digits: int = 4):
+    """小到四舍五入会变成 0 的数写成 "<0.001"，不要假装它是零。"""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    value = float(value)
+    floor = 10 ** -digits
+    if value != 0 and abs(value) < floor:
+        return f"<{floor:g}"
+    return round(value, digits)
+
+
 def pretty_anova(table: pd.DataFrame) -> pd.DataFrame:
     """三线表版式：中文字段名、四舍五入、partial η² 补齐。"""
     frame = table.copy()
@@ -489,10 +500,10 @@ def pretty_anova(table: pd.DataFrame) -> pd.DataFrame:
     frame.index.name = "项"
     frame = frame.reset_index()
     frame["项"] = frame["项"].map(lambda term: ANOVA_LABEL.get(term, term))
-    frame["sum_sq"] = frame["sum_sq"].round(4)
-    frame["F"] = frame["F"].round(3)
-    frame["PR(>F)"] = frame["PR(>F)"].round(3)
-    frame["partial_eta2"] = frame["partial_eta2"].round(3)
+    frame["sum_sq"] = frame["sum_sq"].map(lambda value: _rounded(value, 4))
+    frame["F"] = frame["F"].map(lambda value: _rounded(value, 3))
+    frame["PR(>F)"] = frame["PR(>F)"].map(lambda value: _rounded(value, 3))
+    frame["partial_eta2"] = frame["partial_eta2"].map(lambda value: _rounded(value, 3))
     frame["df"] = frame["df"].astype("Int64")
     return frame.rename(columns={"sum_sq": "平方和", "df": "df", "F": "F", "PR(>F)": "p", "partial_eta2": "partial η²"})
 
@@ -602,14 +613,14 @@ def stage_model(ctx: dict) -> dict:
                     continue
                 sub = smf.ols("AUC_T2 ~ C(intervention) + AUC_T0", data=group).fit()
                 sub_table = anova_lm(sub, typ=2)
-                simple.append({"效应": f"干预 | {salience}", "F": fmt(sub_table.loc["C(intervention)", "F"]),
+                simple.append({"效应": f"干预（{salience}）", "F": fmt(sub_table.loc["C(intervention)", "F"]),
                                "p": fmt(sub_table.loc["C(intervention)", "PR(>F)"]), "df_resid": int(sub.df_resid)})
             for intervention, group in data.groupby("intervention"):
                 if group["salience"].nunique() < 2:
                     continue
                 sub = smf.ols("AUC_T2 ~ C(salience) + AUC_T0", data=group).fit()
                 sub_table = anova_lm(sub, typ=2)
-                simple.append({"效应": f"突显 | {intervention}", "F": fmt(sub_table.loc["C(salience)", "F"]),
+                simple.append({"效应": f"突显（{intervention}）", "F": fmt(sub_table.loc["C(salience)", "F"]),
                                "p": fmt(sub_table.loc["C(salience)", "PR(>F)"]), "df_resid": int(sub.df_resid)})
             if simple:
                 simple_table = pd.DataFrame(simple)
@@ -618,7 +629,7 @@ def stage_model(ctx: dict) -> dict:
             grid = pd.DataFrame({
                 "salience": ["MS", "MS", "DP", "DP"],
                 "intervention": ["EFT", "ERT", "EFT", "ERT"],
-                "AUC_T0": [data["AUC_T0"].mean()] * 4,
+                "AUC_T0": [round(float(data["AUC_T0"].mean()), 3)] * 4,
             })
             prediction = model.get_prediction(grid).summary_frame(alpha=0.05)
             grid["AUC_T2_adj"] = prediction["mean"].round(3)
@@ -640,7 +651,7 @@ def stage_model(ctx: dict) -> dict:
             cook = float(model.get_influence().cooks_distance[0].max())
 
             result["main"] = {
-                "model": "AUC_T2 ~ salience * intervention + AUC_T0（Type III，Sum 编码）",
+                "model": "AUC_T2 ~ 突显 × 干预 + T0 AUC（Type III，Sum 编码）",
                 "n": int(model.nobs),
                 "r2": float(model.rsquared),
                 "r2_adj": float(model.rsquared_adj),
@@ -796,17 +807,21 @@ def stage_report(ctx: dict) -> dict:
         ]
         if "table5_ancova_auc" in tables:
             lines += [md_table(tables["table5_ancova_auc"]), ""]
+        if "table6_simple_effects" in tables:
+            lines += ["## 表 6 简单效应（均控制 T0 AUC）", "", md_table(tables["table6_simple_effects"]), ""]
         if "table7_adjusted_means" in tables:
-            lines += ["调整均值（T0 AUC 固定在总均值）：", "", md_table(tables["table7_adjusted_means"]), ""]
+            lines += ["## 表 7 调整均值（T0 AUC 固定在总均值）", "", md_table(tables["table7_adjusted_means"]), ""]
         if model.get("sensitivity"):
             sensitivity = model["sensitivity"]["interaction"]
             lines += [
-                "## 表 6 敏感性：ln(k)_T2 同一模型",
+                "## 表 8 敏感性：ln(k)_T2 同一模型",
                 "",
                 f"F({sensitivity['df']}) = {sensitivity['F']:.3f}，p = {sensitivity['p']:.3f}，"
                 f"partial η² = {sensitivity['partial_eta2']:.3f}。",
                 "",
             ]
+            if "table8_ancova_lnk" in tables:
+                lines += [md_table(tables["table8_ancova_lnk"]), ""]
     else:
         lines += [
             "## 主分析",
