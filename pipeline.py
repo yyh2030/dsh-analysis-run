@@ -144,11 +144,12 @@ def stage_ingest(ctx: dict) -> dict:
         stat = os.stat(path)
         stamp = {"mtime": int(stat.st_mtime), "size": int(stat.st_size)}
         entry = cached.get(name)
-        cache_name = f"{ddt.sha256_file(path)[:12]}-{name}.csv"
+        digest = ddt.sha256_file(path)
+        cache_name = f"{digest[:12]}-{name}.csv"
         cache_path = os.path.join(files_dir, cache_name)
         if entry and entry.get("mtime") == stamp["mtime"] and entry.get("size") == stamp["size"] and os.path.exists(cache_path):
             reused += 1
-            fresh[name] = dict(entry, cache=cache_name)
+            fresh[name] = dict(entry, cache=cache_name, sha256=digest)
             continue
         try:
             result = ddt.parse_file(path)
@@ -157,8 +158,9 @@ def stage_ingest(ctx: dict) -> dict:
             continue
         write_csv(cache_path, result["trials"])
         parsed += 1
-        fresh[name] = dict(stamp, cache=cache_name, session=result["meta"]["session"], subject=result["meta"]["subject"],
-                           expStart=result["meta"]["expStart"], date=result["meta"]["date"], n_trials=result["meta"]["n_trials"])
+        fresh[name] = dict(stamp, cache=cache_name, sha256=digest, session=result["meta"]["session"],
+                           subject=result["meta"]["subject"], expStart=result["meta"]["expStart"],
+                           date=result["meta"]["date"], n_trials=result["meta"]["n_trials"])
 
     # 已删除的原始文件：连同缓存一起清掉
     removed = [name for name in cached if name not in fresh]
@@ -1071,7 +1073,11 @@ def main(argv=None) -> int:
         meta["figures"] = report_result["figures"]
 
     manifest = load_manifest(cache_dir)
-    meta["inputs"] = {name: {"mtime": entry.get("mtime"), "size": entry.get("size")} for name, entry in manifest.get("files", {}).items()}
+    meta["inputs"] = {
+        name: {"mtime": entry.get("mtime"), "size": entry.get("size"), "sha256": entry.get("sha256"),
+               "session": entry.get("session")}
+        for name, entry in manifest.get("files", {}).items()
+    }
     meta["status"] = "ok" if not failures else "failed"
     meta["failures"] = failures
     meta["finishedAt"] = now_iso()
