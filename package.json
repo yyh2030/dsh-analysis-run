@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "@local/analysis-run",
   "version": "0.1.0",
   "private": true,
@@ -15,6 +15,7 @@
     "pipeline.py",
     "ddt.py",
     "sap.py",
+    "phase.py",
     "client.js",
     "locale/*.json",
     "cordis.patch.yml",

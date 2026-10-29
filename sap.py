@@ -289,8 +289,10 @@ def nonsystematic_table(points: pd.DataFrame | None, dataset: pd.DataFrame) -> t
 
     rows = []
     flagged_subjects = set()
+    strict_subjects = set()
     minor_subjects = set()
     for (subject, session), group in points.groupby(["subjectid", "session"], sort=True):
+        wave = {"001": "T0", "002": "T1", "003": "T2"}.get(str(session).zfill(3), session)
         violations = 0
         flat_high = flat_low = 0
         for amount_ll, tier in group.groupby("amountLL"):
@@ -309,11 +311,13 @@ def nonsystematic_table(points: pd.DataFrame | None, dataset: pd.DataFrame) -> t
         severity = "明确" if (violations >= 2 or extreme) else ("轻微" if violations == 1 else "")
         if severity == "明确":
             flagged_subjects.add(subject)
+            if wave in ("T0", "T2"):
+                strict_subjects.add(subject)
         elif severity == "轻微":
             minor_subjects.add(subject)
         rows.append({
             "被试": subject,
-            "时间点": {"001": "T0", "002": "T1", "003": "T2"}.get(str(session).zfill(3), session),
+            "时间点": wave,
             "单调性违规": violations,
             "两档全不折扣": flat_high,
             "两档全折扣": flat_low,
@@ -326,8 +330,10 @@ def nonsystematic_table(points: pd.DataFrame | None, dataset: pd.DataFrame) -> t
         "sessions_flagged": int((table["标记"] == "明确").sum()),
         "flagged": len(flagged_subjects),
         "flaggedIds": sorted(flagged_subjects),
+        "flaggedStrict": len(strict_subjects),
+        "flaggedStrictIds": sorted(strict_subjects),
         "minor": len(minor_subjects - flagged_subjects),
-        "ppRule": "T0 或 T2 出现「明确」才排除",
+        "ppRule": "T0 或 T2 出现「明确」才排除（严格）；任一波次汇总的旧口径并列保留",
     }
     return table, sorted(flagged_subjects), meta
 
@@ -783,7 +789,8 @@ def run_sap(ctx: dict, dataset: pd.DataFrame, trials: pd.DataFrame | None) -> di
     trait_table, trait_meta = step_pair("特质焦虑", lambda: trait_anxiety(dataset))
     put("table19_trait_anxiety", trait_table)
 
-    pp_table, pp_meta = step_pair("敏感性分析", lambda: pp_sensitivity(dataset, flagged))
+    pp_table, pp_meta = step_pair("敏感性分析", lambda: pp_sensitivity(
+        dataset, nonsystematic_meta.get("flaggedStrictIds") or flagged))
     put("table20_sensitivity", pp_table)
 
     result["secondary"] = {
@@ -792,4 +799,15 @@ def run_sap(ctx: dict, dataset: pd.DataFrame, trials: pd.DataFrame | None) -> di
         "traitAnxiety": trait_meta,
         "sensitivity": pp_meta,
     }
+
+    # 阶段分析、效应估计与敏感性（讨论后新增，见 phase.py）
+    try:
+        import phase
+
+        result["phase"] = phase.run_phase(ctx, dataset, points, flagged,
+                                          nonsystematic_meta.get("flaggedStrictIds") or [])
+    except Exception as error:  # noqa: BLE001 - 阶段分析失败不该丢掉前面的结果
+        result["warnings"].append(f"阶段分析失败：{error}")
+        result["phase"] = None
+
     return result

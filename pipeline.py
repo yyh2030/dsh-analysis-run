@@ -677,6 +677,8 @@ def stage_model(ctx: dict) -> dict:
         if os.path.exists(trials_path):
             trials = pd.read_csv(trials_path, encoding="utf-8-sig", dtype={"subjectid": str, "session": str})
         result["sap"] = sap.run_sap(ctx, dataset, trials)
+        for warning in (result["sap"] or {}).get("warnings", []):
+            result["warnings"].append(warning)
     except Exception as error:  # noqa: BLE001 - SAP 失败不该丢掉主分析
         result["warnings"].append(f"预备/次要分析失败：{error}")
         result["sap"] = None
@@ -937,12 +939,21 @@ def stage_report(ctx: dict) -> dict:
             if len(lmm_rows) and "项" in lmm_rows.columns:
                 t1 = lmm_rows.loc[lmm_rows["项"] == "T1（相对 T0）"]
                 t2 = lmm_rows.loc[lmm_rows["项"] == "T2（相对 T0）"]
+                phase_tables = (sap_result.get("phase") or {}).get("tables") or {}
+                overall = pd.DataFrame(phase_tables.get("table22_overall_changes") or [])
+                overall_text = ""
+                if len(overall):
+                    hit = overall.loc[overall["指标"] == "FTPS T0→T2"]
+                    if len(hit):
+                        overall_text = (f"全样本 FTPS T2−T0 = {hit['平均变化'].iloc[0]}"
+                                        f"（95% CI {hit['95% CI'].iloc[0] if '95% CI' in hit else hit['95%CI'].iloc[0]}，"
+                                        f"p = {hit['p'].iloc[0]}）；")
                 lines += [
-                    "读法："
-                    + (f"T1 相对 T0 变化 {t1['估计'].iloc[0]}（p = {t1['p'].iloc[0]}），" if len(t1) else "")
-                    + (f"T2 相对 T0 变化 {t2['估计'].iloc[0]}（p = {t2['p'].iloc[0]}）；" if len(t2) else "")
-                    + "交互项不显著意味着 EFT 与 ERT、MS 与 DP 的 FTPS 轨迹没有被拉开，"
-                    "这与 15.3 的中介检验结果一致：中介要成立，先得有一致的「操纵 → 中介」路径。",
+                    "读法：表里的时间系数是参照格（DP×EFT）的时间效应，不是全样本平均变化。"
+                    + (f"{overall_text}" if overall_text else "")
+                    + (f"DP×EFT 格内 T1 相对 T0 变化 {t1['估计'].iloc[0]}（p = {t1['p'].iloc[0]}），" if len(t1) else "")
+                    + (f"T2 相对 T0 变化 {t2['估计'].iloc[0]}（p = {t2['p'].iloc[0]}）。" if len(t2) else "")
+                    + "交互项不显著意味着 EFT 与 ERT、MS 与 DP 的 FTPS 轨迹没有被拉开。",
                     "",
                 ]
         mediation = secondary.get("mediation") or {}
@@ -996,6 +1007,80 @@ def stage_report(ctx: dict) -> dict:
                 "结论没有翻转：两个分析集都是「不显著、方向一致」，说明这个排除规则不会改变主结论。",
                 "",
             ]
+
+        phase = sap_result.get("phase") or {}
+        phase_tables = phase.get("tables") or {}
+        if phase_tables:
+            phase_row = pd.DataFrame(phase_tables.get("table23_primary_contrasts") or [])
+            def phase_value(key, effect, column="估计"):
+                frame = pd.DataFrame(phase_tables.get(key) or [])
+                if not len(frame):
+                    return "—"
+                hit = frame.loc[frame["效应"].astype(str) == effect]
+                return hit[column].iloc[0] if len(hit) else "—"
+
+            lines += [
+                "# 阶段分析与效应估计（讨论后新增）",
+                "",
+                "这一组分析是在看过数据之后定的，按探索性理解。它要回答的是「变化发生在哪个阶段」、"
+                "以及「把方向写出来之后还剩多少不确定性」——原来的 F 与 p 不显示方向，也不显示阶段。",
+                "",
+            ]
+            lines += sap_table(
+                "table21_phase_descriptives", "表 21 分阶段描述统计",
+                "DP×EFT 的 AUC 从 T0 到 T2 共升 .225，其中 .179 发生在 EFT 开始之前的 T0→T1；"
+                "而 EFT/ERT 在 T1 之后才开始。所以「EFT 让 DP 组更耐心」这句话，至少要降级为"
+                "「分配到该组的人最终 AUC 更高」。")
+            lines += sap_table("table22_overall_changes", "表 22 全体平均变化",
+                               "全体变化混合了四种条件与任务重复；单看它是描述，不是效应。")
+            lines += sap_table(
+                "table23_primary_contrasts", "表 23 主模型的带方向对比",
+                "交互 = (EFT−ERT)MS − (EFT−ERT)DP，AUC 上为正才符合「MS 后 EFT 优势更大」。"
+                f"本次交互 {phase_value('table23_primary_contrasts', 'interaction')}，点估计与预期方向相反；"
+                f"DP 内 EFT−ERT = {phase_value('table23_primary_contrasts', 'EFT-ERT_DP')}，"
+                f"MS 内 = {phase_value('table23_primary_contrasts', 'EFT-ERT_MS')}。"
+                "这些对比都取自同一个主模型，共用基线斜率与残差方差。")
+            lines += sap_table(
+                "table24_stage_models", "表 24 阶段模型",
+                "诱发阶段只问 MS−DP（控制各自 T0）；干预阶段问 T1 之后新增的差异（控制各自 T1）。"
+                "控制 T1 会改变对突显路径的条件化，所以它回答「干预阶段发生了什么」，"
+                "不能替代原方案控制 T0 的主检验。")
+            lines += sap_table("table25_lmm_three_way", "表 25 完整三时点混合模型",
+                               "三阶交互是两个阶段差异的联合检验；AUC 上 p≈.056、FTPS p≈.35，"
+                               "只能作为分阶段结果的一个旁证。")
+            lines += sap_table(
+                "table26_imagery_contrasts", "表 26 想象过程评价（10 题分别检验）",
+                "EFT 与 ERT 在「主观时间距离」（+2.30）和「事件重要性」（+1.55）上分开，"
+                "这两项在 10 题的 BH 校正后仍显著；生动性、投入没有检测到差异。"
+                "说明操纵确实区分了某些体验，但不能据此说整个未来想象过程都被成功操纵。")
+            lines += sap_table("table27_imagery_associations", "表 27 过程体验与结局的探索关联",
+                               "四项过程 × 两个结局共 8 个斜率，BH 后都不显著；时间距离与 AUC 的"
+                               "原始 p≈.07 只能算线索。过程评价是操纵后变量，不能当协变量「控制掉」。")
+            lines += sap_table(
+                "table28_primary_sensitivity", "表 28 主模型敏感性",
+                "HC3、基线状态焦虑、两套排除规则都改变不了「方向为负、区间跨零」这个模式。"
+                "注意排除名单：原五人里 11016 只有 T1 达到「明确」，严格按 T0/T2 是四人；两套并列。")
+            lines += sap_table("table29_leave_one_out", "表 29 逐人剔除与 Cook's D",
+                               "每次只剔一个人，交互估计始终为负；这排除了「一个人撑起结果」，"
+                               "但也说明大小仍随个体变动。")
+            lines += sap_table(
+                "table30_delay_contrasts", "表 30 五个延迟点的干预阶段交互",
+                "5 年延迟点交互 −.275，五延迟 Holm p = .030；但它对规格敏感（见表 31），"
+                "而且方向与 H1 相反，只能作为「变化集中在哪个区间」的探索线索。")
+            lines += sap_table("table31_delay_sensitivity", "表 31 5 年延迟点的规格敏感性",
+                               "换成 T0 校正、双校正、HC3 之后，显著性在 .01–.31 之间摆动；"
+                               "说明这个点是设定敏感的，不能写成一个稳定发现。")
+            lines += sap_table("table32_tier_contrasts", "表 32 金额档",
+                               "两档交互都为负、量级接近；档间差值的交互 p≈.89，"
+                               "没有证据说效应与大/小金额有关。")
+            lines += sap_table("table33_logdelay_auc", "表 33 对数延迟 AUC（形状敏感性）",
+                               "原 AUC 的线性时间轴让长延迟区间占权重更大；换对数轴后方向不变、"
+                               "区间仍跨零（−.221，p≈.14），说明结论不是积分方式造成的。")
+            lines += sap_table("table34_emotion_changes", "表 34 情绪次要结果（分格变化）",
+                               "四格的情绪变化方向并不一致；全体略降不足以说明「情绪机制已排除」。")
+            lines += sap_table("table35_emotion_contrasts", "表 35 情绪交互",
+                               "STAI-S 交互 −10.59（p≈.08）、PANAS-NA −0.59（p≈.12），区间都很宽；"
+                               "后测情绪在主要结局之后测量，不能当作干预前的协变量。")
 
     if figures:
         lines += ["## 图", ""] + [f"![{os.path.basename(path)}]({os.path.basename(path)})" for path in figures] + [""]
