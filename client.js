@@ -80,13 +80,15 @@ window.__ModuleLoader__.load({
 .ar-tab.is-active{background:var(--ar-raised);border-color:var(--ar-line);color:var(--ar-text);font-weight:600}
 .ar-chip{height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--ar-line);background:var(--ar-bg);color:var(--ar-text2);font-size:11.5px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:inherit}
 .ar-chip.is-active{color:var(--ar-text);border-color:var(--ar-line2);background:var(--ar-raised);font-weight:600}
-.ar-table-wrap{border:1px solid var(--ar-line);border-radius:12px;overflow:auto;background:var(--ar-bg)}
-.ar-table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
-.ar-table caption{caption-side:top;text-align:left;padding:10px 12px 6px;font-size:12px;color:var(--ar-text2)}
-.ar-table th{text-align:left;padding:8px 11px;border-top:1.5px solid var(--ar-text);border-bottom:1px solid var(--ar-text);font-weight:600;font-size:11.5px;white-space:nowrap;background:var(--ar-bg)}
-.ar-table td{padding:6px 11px;white-space:nowrap;border-bottom:1px solid var(--ar-line)}
-.ar-table tbody tr:last-child td{border-bottom:1.5px solid var(--ar-text)}
-.ar-table td.num{text-align:right}
+.ar-table-wrap{overflow:auto;background:var(--ar-bg);padding:0 0 2px}
+.ar-table-title{font-size:12px;color:var(--ar-text2);padding:4px 0 8px}
+.ar-table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums;border-top:1.5px solid var(--ar-text);border-bottom:1.5px solid var(--ar-text)}
+.ar-table caption{caption-side:top;text-align:left;padding:4px 0 8px;font-size:12px;color:var(--ar-text2)}
+.ar-table th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--ar-text);font-weight:600;font-size:11.5px;white-space:nowrap;background:var(--ar-bg)}
+.ar-table td{padding:6px 10px;white-space:nowrap;border:0}
+.ar-table th.num,.ar-table td.num{text-align:right}
+.ar-table th:first-child,.ar-table td:first-child{padding-left:2px}
+.ar-table th:last-child,.ar-table td:last-child{padding-right:2px}
 .ar-note{font-size:11.5px;color:var(--ar-text2);margin-top:8px}
 .ar-report{white-space:pre-wrap;font-size:12.5px;line-height:1.7;font-family:inherit;border:1px solid var(--ar-line);border-radius:12px;background:var(--ar-bg);padding:14px 16px;max-height:none;overflow:auto;margin:0}
 .ar-figs{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
@@ -161,14 +163,20 @@ window.__ModuleLoader__.load({
     function Table({ table }) {
       const [expanded, setExpanded] = useState(false)
       const rows = expanded ? table.rows : table.rows.slice(0, 40)
+      // 列的对齐按整列内容定：全列都是数字（或空）就右对齐，表头也跟着右对齐
+      const numeric = table.columns.map((_column, index) => table.rows.length > 0
+        && table.rows.every(row => row[index] === '' || row[index] === undefined || num(row[index])))
       return h('div', { className: 'ar-table-wrap' },
+        h('div', { className: 'ar-table-title' }, table.label),
         h('table', { className: 'ar-table' },
-          h('caption', null, table.label),
-          h('thead', null, h('tr', null, table.columns.map(column => h('th', { key: column }, column)))),
+          h('thead', null, h('tr', null, table.columns.map((column, index) => h('th', {
+            key: column,
+            className: numeric[index] ? 'num' : undefined
+          }, column)))),
           h('tbody', null, rows.map((row, index) => h('tr', { key: index },
             row.map((cell, columnIndex) => h('td', {
               key: columnIndex,
-              className: num(cell) ? 'num' : undefined
+              className: numeric[columnIndex] ? 'num' : undefined
             }, cell === '' ? '—' : String(cell))))))
         ),
         table.rows.length > 40
