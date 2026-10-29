@@ -1,4 +1,4 @@
-/**
+﻿/**
  * analysis-run — Host half.
  *
  * 一条 HTTP 路由服务面板「分析」页；四个工具把同一份状态与结果交给 agent。
@@ -194,7 +194,19 @@ const TABLE_LABEL = {
   table5_ancova_auc: '表 5 主分析 ANCOVA',
   table6_simple_effects: '表 6 简单效应',
   table7_adjusted_means: '表 7 调整均值',
-  table8_ancova_lnk: '表 8 敏感性 ln(k)'
+  table8_ancova_lnk: '表 8 敏感性 ln(k)',
+  table9_missing: '表 9 缺失与完成',
+  table10_completion: '表 10 完成率与超时',
+  table11_distribution: '表 11 分布特征',
+  table12_reliability: '表 12 FTPS 信度',
+  table13_balance: '表 13 基线平衡',
+  table14_nonsystematic: '表 14 非系统折扣',
+  table15_prepilot: '表 15 预实验 DTA',
+  table16_stai_change: '表 16 STAI-S 变化',
+  table17_ftps_lmm: '表 17 FTPS 混合模型',
+  table18_mediation: '表 18 中介分析',
+  table19_trait_anxiety: '表 19 特质焦虑',
+  table20_sensitivity: '表 20 ITT/PP 敏感性'
 }
 
 /* ------------------------------------------------------------------ *

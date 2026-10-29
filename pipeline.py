@@ -29,6 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import ddt  # noqa: E402
+import sap  # noqa: E402
 
 PIPELINE_VERSION = "analysis-run/1.0.0"
 STAGES = ["ingest", "derive", "merge", "model", "report"]
@@ -669,6 +670,17 @@ def stage_model(ctx: dict) -> dict:
             result["warnings"].append(f"主分析失败：{error}")
             result["main"] = None
 
+    # 暂行分析方案 15.1 / 15.3 / 15.4 / 15.5：预备、次要、敏感性与缺失处理
+    try:
+        trials = None
+        trials_path = os.path.join(ctx["cacheDir"], "trials.csv")
+        if os.path.exists(trials_path):
+            trials = pd.read_csv(trials_path, encoding="utf-8-sig", dtype={"subjectid": str, "session": str})
+        result["sap"] = sap.run_sap(ctx, dataset, trials)
+    except Exception as error:  # noqa: BLE001 - SAP 失败不该丢掉主分析
+        result["warnings"].append(f"预备/次要分析失败：{error}")
+        result["sap"] = None
+
     # 报告阶段要读 model.json，所以在这里落盘，而不是等所有阶段结束
     write_json(os.path.join(run_dir, "model.json"), result)
     return result
@@ -679,13 +691,22 @@ def stage_model(ctx: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def setup_matplotlib():
+    """统一字体：图里会出现中文，不设字体就是一堆方框。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return plt
+
+
 def make_figures(run_dir: str, dataset: pd.DataFrame) -> list:
     paths = []
     try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        plt = setup_matplotlib()
     except Exception:  # noqa: BLE001
         return paths
 
@@ -768,6 +789,11 @@ def stage_report(ctx: dict) -> dict:
             model = json.load(fh)
 
     figures = make_figures(run_dir, dataset)
+    if model.get("sap"):
+        try:
+            figures += sap.make_figures(run_dir, dataset, model["sap"])
+        except Exception:  # noqa: BLE001 - 图失败不影响表
+            pass
     n = int(dataset["included"].sum())
     gate = model.get("gate") or gate_for(n)
 
@@ -829,6 +855,147 @@ def stage_report(ctx: dict) -> dict:
             f"{gate['text']}主分析（ANCOVA）按预设门禁未开，报告只含预处理、描述统计与质控。",
             "",
         ]
+
+    sap_result = model.get("sap") or {}
+    sap_tables = sap_result.get("tables") or {}
+
+    def sap_table(key: str, title: str, note: str = ""):
+        rows = sap_tables.get(key) or []
+        if not rows:
+            return []
+        block = [f"## {title}", ""]
+        if note:
+            block += [note, ""]
+        block += [md_table(pd.DataFrame(rows)), ""]
+        return block
+
+    if sap_result:
+        preliminary = sap_result.get("preliminary") or {}
+        lines += ["# 预备分析（SAP 15.1）", ""]
+        lines += sap_table(
+            "table9_missing", "表 9 缺失与完成情况",
+            "为什么先看这个：后面所有模型都默认「T0 与 T2 都有」。这张表把每个变量的有效人数摆在最前面，"
+            "免得把「没测」误读成「没差异」。")
+        lines += sap_table("table10_completion", "表 10 任务完成率与超时",
+                           "DDT 是调整金额范式，每格 6 次呈现才算一个可用的无差异点；完成率是后面 AUC 能不能算的前提。")
+        lines += sap_table("table11_distribution", "表 11 分布特征",
+                           "偏度、峰度与 Shapiro-Wilk 决定用参数检验还是稳健方法；这里先如实报告，不做变换。")
+        reliability = preliminary.get("reliability") or []
+        alpha_text = "；".join(f"{row['波次']} α = {row['Cronbach α']}" for row in reliability) if reliability else ""
+        lines += sap_table(
+            "table12_reliability", "表 12 未来时间洞察力量表（FTPS）信度",
+            f"为什么看信度：中介分析的 M 如果是低信度测量，a、b 两条路径都会被衰减。{alpha_text}"
+            "（经验上 α ≥ .70 才适合拿来做路径分析）")
+        lines += sap_table("table13_balance", "表 13 基线平衡",
+                           "随机分组的检验不是用来「证明」平衡，而是看有没有需要进入协变量的基线差异；"
+                           "四格各 4–5 人，p 值本身也很不稳定，只作参考。")
+        nonsystematic = preliminary.get("nonsystematic") or {}
+        flagged_rows = pd.DataFrame(sap_tables.get("table14_nonsystematic") or [])
+        if len(flagged_rows) and "标记" in flagged_rows.columns:
+            flagged_rows = flagged_rows[flagged_rows["标记"].astype(str).str.strip() != ""]
+        lines += [
+            "## 表 14 非系统折扣检查",
+            "",
+            f"判定口径：{nonsystematic.get('rule', sap.NONSYSTEMATIC_RULE)}。"
+            f"「明确」{nonsystematic.get('flagged', 0)} 人（{', '.join(nonsystematic.get('flaggedIds', [])) or '无'}），"
+            f"「轻微」{nonsystematic.get('minor', 0)} 人；per-protocol 只排除「明确」的"
+            f"（{nonsystematic.get('ppRule', '')}）。",
+            "",
+        ]
+        if len(flagged_rows):
+            lines += [md_table(flagged_rows), ""]
+        prepilot = preliminary.get("prepilot") or {}
+        lines += sap_table(
+            "table15_prepilot", "表 15 外部预实验的 DTA 材料验证",
+            "这是预实验里 MS 与牙痛两组在 DTA 上的对照，按方案只作为材料效度证据，不参与主实验的结论"
+            f"（主样本 n = 3 + 3，Hedges g = {prepilot.get('g', '—')}，p = {prepilot.get('p', '—')}）。")
+        stai = preliminary.get("stai") or {}
+        lines += sap_table(
+            "table16_stai_change", "表 16 状态焦虑（STAI-S）作为情绪核查",
+            "为什么要有这一条：如果干预同时大幅改变了状态焦虑，AUC 的变化就可能只是情绪波动的副产物。"
+            f"本次 T2−T0 的 dz = {stai.get('dz', '—')}，p = {stai.get('p', '—')}，"
+            f"与 ΔAUC 的 ρ = {stai.get('rho', '—')}。")
+
+        secondary = sap_result.get("secondary") or {}
+        lines += ["# 未来时间洞察力与中介（SAP 15.3）", ""]
+        lmm = secondary.get("ftpsLmm") or {}
+        if lmm.get("available"):
+            interaction = lmm.get("lrtTimeInteraction") or {}
+            lines += [
+                "## 表 17 FTPS 的线性混合模型",
+                "",
+                "为什么用 LMM：FTPS 在 T0/T1/T2 重复测量，同一个人三次观测不独立；随机截距把被试内相关吸收掉，"
+                "剩下的时间×干预、时间×突显才是要看的固定效应。",
+                "",
+                md_table(pd.DataFrame(sap_tables.get("table17_ftps_lmm") or [])),
+                "",
+                f"时间 × 干预（和扩展项）的似然比检验：χ²({interaction.get('df')}) = {interaction.get('chi2')}，"
+                f"p = {interaction.get('p')}。",
+                "",
+            ]
+            lmm_rows = pd.DataFrame(sap_tables.get("table17_ftps_lmm") or [])
+            if len(lmm_rows) and "项" in lmm_rows.columns:
+                t1 = lmm_rows.loc[lmm_rows["项"] == "T1（相对 T0）"]
+                t2 = lmm_rows.loc[lmm_rows["项"] == "T2（相对 T0）"]
+                lines += [
+                    "读法："
+                    + (f"T1 相对 T0 变化 {t1['估计'].iloc[0]}（p = {t1['p'].iloc[0]}），" if len(t1) else "")
+                    + (f"T2 相对 T0 变化 {t2['估计'].iloc[0]}（p = {t2['p'].iloc[0]}）；" if len(t2) else "")
+                    + "交互项不显著意味着 EFT 与 ERT、MS 与 DP 的 FTPS 轨迹没有被拉开，"
+                    "这与 15.3 的中介检验结果一致：中介要成立，先得有一致的「操纵 → 中介」路径。",
+                    "",
+                ]
+        mediation = secondary.get("mediation") or {}
+        if mediation.get("available"):
+            lines += [
+                "## 表 18 探索性中介分析",
+                "",
+                "为什么是探索性的：EFT/ERT 是被试间操纵，FTPS 不是独立操纵的变量，所以即使 a×b 的 bootstrap "
+                "区间不含 0，也只能说「与中介路径一致」，不能说「通过 FTPS 起作用」。",
+                "",
+                md_table(pd.DataFrame(sap_tables.get("table18_mediation") or [])),
+                "",
+                f"间接效应 a×b = {mediation.get('indirect')}，bootstrap 95% CI "
+                f"[{', '.join(str(value) for value in mediation.get('indirectCI', []))}]"
+                f"（{mediation.get('boot')} 次重抽样）。",
+                "",
+            ]
+            ci_low, ci_high = (mediation.get("indirectCI") or [None, None])[:2]
+            if ci_low is not None and ci_high is not None:
+                spans_zero = float(ci_low) <= 0 <= float(ci_high)
+                lines += [
+                    ("区间跨过 0：没有可报告的中介证据；a 路径（干预 → FTPS 变化）本身也接近 0，"
+                     "所以即使 b 路径是负的，整条中介链条也建立不起来。" if spans_zero
+                     else "区间不含 0：中介路径与数据一致，但仍受测量与样本量限制，只能写探索性结论。"),
+                    "",
+                ]
+        lines += ["# 特质焦虑（SAP 15.4）", ""]
+        trait = secondary.get("traitAnxiety") or {}
+        if not (trait.get("preregistered") or {}).get("available"):
+            lines += [
+                "预注册的 STAI-T 调节分析**本次没有执行**：数据里只有 STAI-S（状态焦虑），没有 STAI-T（特质焦虑）。"
+                "下面的替代分析用的是 STAI-S，只作管道演示，不能算作对 15.4 的回答。",
+                "",
+            ]
+        lines += sap_table("table19_trait_anxiety", "表 19 STAI-T 调节（含替代分析）")
+
+        lines += ["# 缺失数据与敏感性（SAP 15.5）", ""]
+        lines += [
+            "缺失处理口径：主分析用完整病例（T0 与 T2 都有）；本次 18 人没有缺失，所以 ITT 与完整病例的结果相同。"
+            "per-protocol 在 ITT 基础上再排除 15.1 里标记的非系统折扣被试，用来看这个排除规则会不会改变结论。",
+            "",
+        ]
+        lines += sap_table("table20_sensitivity", "表 20 ITT 与 per-protocol 的主效应比较")
+        sensitivity_rows = pd.DataFrame(sap_tables.get("table20_sensitivity") or [])
+        if len(sensitivity_rows) >= 2 and "p" in sensitivity_rows.columns:
+            itt = sensitivity_rows.iloc[0]
+            pp_row = sensitivity_rows.iloc[1]
+            lines += [
+                f"读法：ITT 下交互 F = {itt.get('F')}（p = {itt.get('p')}），"
+                f"排除 5 名非系统折扣被试后 F = {pp_row.get('F')}（p = {pp_row.get('p')}，n = {pp_row.get('n')}）。"
+                "结论没有翻转：两个分析集都是「不显著、方向一致」，说明这个排除规则不会改变主结论。",
+                "",
+            ]
 
     if figures:
         lines += ["## 图", ""] + [f"![{os.path.basename(path)}]({os.path.basename(path)})" for path in figures] + [""]

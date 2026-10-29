@@ -16,12 +16,15 @@ DDT 原始 CSV → 逐试次长表 → 无差异点 / AUC / k → 三线表、�
     auc_wide.csv               每被试一行（T0/T1/T2 宽表 + 分组）
   runs/<runId>/                每次运行，runId = YYYYMMDD-HHMMSS
     dataset.csv                合并后的分析数据集（含 included / excluded 列）
-    tables/table1..8*.csv      三线表（utf-8-sig，Excel 直接开）
+    tables/table1..20*.csv     三线表（utf-8-sig，Excel 直接开）
     fig_auc_trajectory.png     各格 AUC 轨迹（M ± SE）
     fig_auc_by_cell.png        T2 各格分布
-    model.json                 描述统计、主分析、敏感性、假设检查
+    fig_ftps_trajectory.png    FTPS 三波轨迹
+    fig_delta_ftps_auc.png     ΔFTPS 与 T2 AUC 的散点
+    fig_mediation.png          中介路径示意（a / b / 间接效应）
+    model.json                 描述统计、主分析、敏感性、SAP 结果
     meta.json                  输入指纹、n、included/excluded、门禁、与上次的差异
-    report.md                  报告（表、图、口径）
+    report.md                  报告（表、图、口径、每张表的解读）
   exclusions.csv               排除名单：编号,原因,时间,操作
 ```
 
@@ -35,10 +38,29 @@ DDT 原始 CSV → 逐试次长表 → 无差异点 / AUC / k → 三线表、�
 | 1 ingest | 解析 `正式实验数据/DDT/*.csv`，拼成逐试次长表 | 每个文件的 mtime + size（变了才重解析） |
 | 2 derive | 每格第 6 次呈现 → 无差异点 → 归一化 AUC 与 k | 逐试次长表 |
 | 3 merge | AUC 宽表 + `_lab/scores.csv` + `demographics.json` + 排除名单 | 各输入文件 |
-| 4 model | 描述统计、质控、T2−T0 变化；门禁到了再跑 ANCOVA | 数据集 + 脚本哈希 |
-| 5 report | 三线表、两张图、`report.md` | 模型输出 |
+| 4 model | 描述统计、质控、T2−T0 变化；门禁到了再跑 ANCOVA；再跑 SAP（15.1/15.3/15.4/15.5） | 数据集 + 脚本哈希 |
+| 5 report | 三线表、五张图、`report.md`（含每张表的「为什么」与「意味着什么」） | 模型输出 |
 
 新被试进来时只有摄取阶段真的干活；其余阶段重算，n 不到 200 时整条管子在一两秒内跑完。
+
+## 暂行分析方案（SAP）落地
+
+`model` 阶段在描述统计之后自动跑 `sap.py`，覆盖方案里数据能支持的条目：
+
+| 表 | 内容 | 方案条目 |
+|---|---|---|
+| 9–16 | 缺失与完成、完成率、分布、FTPS 信度（含反向计分）、基线平衡、非系统折扣（分级）、预实验 DTA、STAI-S 变化 | 15.1 |
+| 17 | FTPS 在 T0/T1/T2 的线性混合模型（随机截距，时间 × 干预 / 时间 × 突显，LRT） | 15.3 |
+| 18 | 探索性 bootstrap 中介（a、b、a×b、总效应），5000 次重抽样 | 15.3 |
+| 19 | STAI-T 调节：**未执行**（数据里没有 STAI-T）+ STAI-S 的替代探索模型 | 15.4 |
+| 20 | ITT 与 per-protocol（排除「明确」非系统折扣）的主效应比较 | 15.5 |
+
+几条固定口径：
+
+- 非系统折扣按 Johnson & Bickel (2008) 的 20% 规则分级：≥2 次违规或两端极端反应记「明确」，
+  1 次记「轻微」；per-protocol 只排除「明确」的（否则 18 人里要筛掉 11 人）。
+- FTPS 信度必须按定义反向（第 8/9/10 题）；不反向直接算 α 会得到接近 0 的假象。
+- 中介只作探索：EFT/ERT 是被试间操纵，FTPS 不是独立操纵变量。
 
 ## 口径（改之前先想清楚）
 

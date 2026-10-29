@@ -14,6 +14,7 @@
     "index.js",
     "pipeline.py",
     "ddt.py",
+    "sap.py",
     "client.js",
     "locale/*.json",
     "cordis.patch.yml",
