@@ -5,5 +5,5 @@
         projectRoot: 'C:/Users/16787/OneDrive/Desktop/yyh硕士论文'
         labDir: 'D:/yyh-lab'
         pythonPath: 'C:/Users/16787/OneDrive/Desktop/yyh硕士论文/04_预实验数据与分析/.analysis_venv/Scripts/python.exe'
-        gateExplore: 30
-        gateMain: 40
+        gateExplore: 12
+        gateMain: 12

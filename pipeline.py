@@ -45,6 +45,7 @@ STAGE_LABEL = {
 GATE_DESCRIBE = 1
 GATE_EXPLORE = int(os.environ.get("DDT_GATE_EXPLORE", "30"))
 GATE_MAIN = int(os.environ.get("DDT_GATE_MAIN", "40"))
+GATE_MAIN_DESIGN = 40  # 设计稿预设：样本不到 40 的主分析只作探索
 
 # 数据集里从 _lab/scores.csv 带进来的分数列（保持 _lab 的列名）
 SCORE_KEEP_SUFFIX = ("_T0", "_T1", "_T2", "_week", "_post", "_meta", "_ts", "_imagery")
@@ -390,8 +391,13 @@ def gate_for(n: int) -> dict:
     if n < GATE_MAIN:
         return {"level": "explore", "n": n, "model": False, "explore": True,
                 "text": f"n = {n}，在 {GATE_EXPLORE}–{GATE_MAIN - 1} 之间：描述统计 + 探索性比较（明确标探索性），不出主分析。"}
-    return {"level": "main", "n": n, "model": True, "explore": True,
-            "text": f"n = {n} ≥ {GATE_MAIN}：开主分析（ANCOVA）并给出敏感性分析。"}
+    forced = n < GATE_MAIN_DESIGN
+    text = f"n = {n} ≥ {GATE_MAIN}：开主分析（ANCOVA）并给出敏感性分析。"
+    if forced:
+        text = (f"n = {n} ≥ {GATE_MAIN}：主分析已打开，但样本低于预设门禁 {GATE_MAIN_DESIGN}，"
+                f"结论只作探索性参考，不写进论文定论。")
+    return {"level": "main", "n": n, "model": True, "explore": True, "forced": forced,
+            "text": text}
 
 
 def descriptives(dataset: pd.DataFrame) -> pd.DataFrame:
@@ -463,6 +469,34 @@ def fit_ancova(data: pd.DataFrame, dv: str):
     return smf.ols(formula, data=data).fit()
 
 
+ANOVA_LABEL = {
+    "Intercept": "截距",
+    "C(salience, Sum)": "突显",
+    "C(intervention, Sum)": "干预",
+    "C(salience, Sum):C(intervention, Sum)": "突显 × 干预",
+    "AUC_T0": "T0 基线（协变量）",
+    "lnk_T0": "T0 基线（协变量）",
+    "Residual": "残差",
+}
+
+
+def pretty_anova(table: pd.DataFrame) -> pd.DataFrame:
+    """三线表版式：中文字段名、四舍五入、partial η² 补齐。"""
+    frame = table.copy()
+    ss_res = frame.loc["Residual", "sum_sq"]
+    frame["partial_eta2"] = frame["sum_sq"] / (frame["sum_sq"] + ss_res)
+    frame.loc["Residual", "partial_eta2"] = np.nan
+    frame.index.name = "项"
+    frame = frame.reset_index()
+    frame["项"] = frame["项"].map(lambda term: ANOVA_LABEL.get(term, term))
+    frame["sum_sq"] = frame["sum_sq"].round(4)
+    frame["F"] = frame["F"].round(3)
+    frame["PR(>F)"] = frame["PR(>F)"].round(3)
+    frame["partial_eta2"] = frame["partial_eta2"].round(3)
+    frame["df"] = frame["df"].astype("Int64")
+    return frame.rename(columns={"sum_sq": "平方和", "df": "df", "F": "F", "PR(>F)": "p", "partial_eta2": "partial η²"})
+
+
 def anova_row(model, term: str):
     from statsmodels.stats.anova import anova_lm
 
@@ -507,6 +541,10 @@ def stage_model(ctx: dict) -> dict:
 
     n = int(dataset["included"].sum())
     gate = gate_for(n)
+    gate_warnings = []
+    if gate.get("forced"):
+        gate_warnings.append(
+            f"样本量 n = {n} 未到预设门禁 {GATE_MAIN_DESIGN}：主分析按当前设置提前打开，结果只作探索性参考。")
     tables_dir = os.path.join(run_dir, "tables")
     os.makedirs(tables_dir, exist_ok=True)
 
@@ -527,7 +565,7 @@ def stage_model(ctx: dict) -> dict:
         "main": None,
         "sensitivity": None,
         "exploratory": None,
-        "warnings": [],
+        "warnings": gate_warnings,
         "artifacts": [os.path.join(tables_dir, name) for name in sorted(os.listdir(tables_dir))],
     }
 
@@ -555,11 +593,7 @@ def stage_model(ctx: dict) -> dict:
 
             model = fit_ancova(data, "AUC_T2")
             interaction, table = anova_row(model, "C(salience, Sum):C(intervention, Sum)")
-            anova_out = table.copy()
-            anova_out["partial_eta2"] = anova_out["sum_sq"] / (anova_out["sum_sq"] + anova_out.loc["Residual", "sum_sq"])
-            anova_out.loc["Residual", "partial_eta2"] = np.nan
-            anova_out.index.name = "项"
-            anova_out = anova_out.reset_index()
+            anova_out = pretty_anova(table)
             write_csv(os.path.join(tables_dir, "table5_ancova_auc.csv"), anova_out)
 
             simple = []
@@ -597,7 +631,7 @@ def stage_model(ctx: dict) -> dict:
 
             lnk_model = fit_ancova(data, "lnk_T2")
             lnk_interaction, lnk_table = anova_row(lnk_model, "C(salience, Sum):C(intervention, Sum)")
-            write_csv(os.path.join(tables_dir, "table8_ancova_lnk.csv"), lnk_table.reset_index())
+            write_csv(os.path.join(tables_dir, "table8_ancova_lnk.csv"), pretty_anova(lnk_table))
 
             residuals = model.resid
             shapiro_p = float(stats.shapiro(residuals)[1]) if len(residuals) >= 3 else float("nan")
@@ -736,6 +770,8 @@ def stage_report(ctx: dict) -> dict:
             if int(dataset["excluded"].sum()) else ""),
         f"- 门禁：{gate['text']}",
         f"- 脚本：{PIPELINE_VERSION}（{ctx.get('scriptHash', '')[:12]}）",
+        *([f"- 注意：样本量低于预设门禁 {GATE_MAIN_DESIGN}，主分析只作探索性参考，不写进论文定论。"]
+          if gate.get("forced") else []),
         "",
     ]
 

@@ -9,7 +9,6 @@
  */
 
 import { spawn } from 'node:child_process'
-import { createReadStream } from 'node:fs'
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -505,20 +504,24 @@ export function apply(ctx, config = {}) {
   }
 
   const handler = async (req, res) => {
-    if (!sameOrigin(req) || req.headers[HEADER] !== '1') {
+    const url = new URL(req.url || ROUTE, 'http://localhost')
+    // <img> 带不了自定义头：图片只读、同源，按 sameOrigin 单独放行
+    const isFigure = req.method === 'GET' && url.searchParams.get('action') === 'figure'
+    if (!sameOrigin(req) || (!isFigure && req.headers[HEADER] !== '1')) {
       send(res, 403, { ok: false, error: { code: 'forbidden', message: '拒绝跨站访问分析接口' } })
       return
     }
     try {
-      const url = new URL(req.url || ROUTE, 'http://localhost')
       if (req.method === 'GET') {
         const action = url.searchParams.get('action') || 'status'
         if (action === 'figure') {
           const target = await figureFile(url.searchParams.get('run'), url.searchParams.get('name'))
+          const body = await readFile(target)
           res.statusCode = 200
           res.setHeader('content-type', 'image/png')
+          res.setHeader('content-length', String(body.length))
           res.setHeader('cache-control', 'no-cache')
-          createReadStream(target).pipe(res)
+          res.end(body)
           return
         }
         const run = actions[action]

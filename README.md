@@ -87,7 +87,10 @@ DDT 原始 CSV → 逐试次长表 → 无差异点 / AUC / k → 三线表、�
 | `labDir` | `D:/yyh-lab` | 缓存、运行记录、排除名单 |
 | `rawDir` | `<projectRoot>/正式实验数据/DDT` | 原始 CSV 目录 |
 | `pythonPath` | 项目里的 `.analysis_venv` | 需要 pandas / numpy / scipy / statsmodels（画图另需 matplotlib） |
-| `gateExplore` / `gateMain` | 30 / 40 | 门禁 |
+| `gateExplore` / `gateMain` | 12 / 12（当前配置；设计稿预设 30 / 40） | 门禁。低于 40 时主分析照跑，但报告会标「只作探索性参考」 |
+
+> 当前为了先看主分析，配置里把门禁降到了 12；报告与 `meta.json` 都会注明「样本低于预设门禁 40，
+> 只作探索」。等 n 到 40 时把 `gateExplore`/`gateMain` 改回 30/40，这个提示会自动消失。
 
 ## 测试
 

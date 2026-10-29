@@ -112,6 +112,12 @@ const figureName = figures && figures.body.data.figures.length ? figures.body.da
 if (figureName) {
   const figure = await request(`/api/analysis-run?action=figure&run=${run.body.data.runId}&name=${encodeURIComponent(figureName)}`)
   check('figure 是 PNG', figure.status === 200 && figure.type.includes('image/png') && figure.body.length > 1000)
+  // 浏览器 <img> 带不了自定义头，只能靠同源检查放行
+  const bare = await fetch(`${base}/api/analysis-run?action=figure&run=${run.body.data.runId}&name=${encodeURIComponent(figureName)}`)
+  check('figure 无自定义头也能取（img 场景）', bare.status === 200 && (bare.headers.get('content-type') || '').includes('image/png'))
+  const bareCross = await fetch(`${base}/api/analysis-run?action=figure&run=${run.body.data.runId}&name=${encodeURIComponent(figureName)}`,
+    { headers: { origin: 'http://evil.example' } })
+  check('figure 跨站仍被拒', bareCross.status === 403)
 } else {
   check('figure 存在', false, '这次运行没有图')
 }
