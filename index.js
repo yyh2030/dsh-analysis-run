@@ -1,738 +1,719 @@
-﻿/**
- * analysis-run — Host half.
- *
- * 一条 HTTP 路由服务面板「分析」页；四个工具把同一份状态与结果交给 agent。
- * 原始数据只读：本插件只写 `_lab/cache`、`_lab/runs` 与 `_lab/exclusions.csv`。
- *
- * 数据契约（见 README）：原始 CSV 与量表答案是原始数据；cache 与 runs 都是缓存，
- * 删掉可以重建，但 runs/<runId>/meta.json 是唯一说明「哪版数据对哪版结果」的记录。
- */
-
 import { spawn } from 'node:child_process'
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import { existsSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { loadStudyContext, validateStudyDefinition } from './study-context.mjs'
+import { hostBinding, bindingStatus } from '../research-core/host.mjs'
+import { openResearchData } from '../research-core/data.mjs'
+import { openAnalysis, AnalysisError as CoreAnalysisError } from '../research-core/analysis.mjs'
+import { buildResults, renderHtmlReport, tableFromGrid, artifactManifest } from '../research-core/results.mjs'
+import { pointRangeChart, forestChart, distributionChart, pairedChart, renderPng, renderPdf } from '../research-core/charts.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
+const LOADED_HASHES = Object.fromEntries(['index.js','study-context.mjs','study-selection.mjs'].map(name => [name, createHash('sha256').update(readFileSync(path.join(HERE,name))).digest('hex')]))
 const ROUTE = '/api/analysis-run'
-const HEADER = 'x-analysis-run'
-const MAX_BODY = 1024 * 1024
-const RUN_TIMEOUT_MS = 15 * 60 * 1000
-const STAGES = ['ingest', 'derive', 'merge', 'model', 'report']
-const STAGE_LABEL = {
-  ingest: '摄取（原始 CSV → 逐试次长表）',
-  derive: '推导（无差异点 → AUC / k）',
-  merge: '合并（AUC + 量表分 + 人口学 + 排除）',
-  model: '模型（描述统计 / 主分析）',
-  report: '报告（三线表、图、md）'
+const MODULES = [{ id: 'descriptives', label: '描述统计' }, { id: 'sample', label: '样本特征表' }, { id: 'sensitivity', label: '敏感性分析' }, { id: 'correlation', label: '相关分析' }, { id: 'reliability', label: '信度' }, { id: 'ttest', label: 't 检验' }, { id: 'anova', label: '方差分析' }, { id: 'mediation', label: '中介分析' }, { id: 'script', label: '自定义脚本' }, { id: 'regression', label: '组间回归 / ANCOVA' }, { id: 'paired', label: '配对变化' }, { id: 'mixed', label: '被试内线性混合模型' }]
+const LOCKS = new Map()
+const WRITES = new Map()
+async function atomicJson(file, value) {
+  await mkdir(path.dirname(file), { recursive: true })
+  const temporary = file + '.' + process.pid + '.' + Date.now() + '.tmp'
+  try { await writeFile(temporary, JSON.stringify(value, null, 2), { encoding: 'utf8', flag: 'wx' }); await rename(temporary, file) }
+  finally { await rm(temporary, { force: true }).catch(() => {}) }
 }
+async function serialWrite(key, operation) {
+  if (WRITES.has(key) || LOCKS.has(key)) throw new AnalysisError('busy', '当前研究正在运行或保存，请稍后重试')
+  WRITES.set(key, true)
+  try { return await operation() } finally { WRITES.delete(key) }
+}
+const hash = text => createHash('sha256').update(text).digest('hex')
+const readJson = async (file, fallback) => { try { return JSON.parse(await readFile(file, 'utf8')) } catch { return fallback } }
+class AnalysisError extends Error { constructor(code, message, details) { super(message); this.code = code; this.details = details } }
 
-const DEFAULT_PROJECT = 'C:/Users/16787/OneDrive/Desktop/yyh硕士论文'
-const DEFAULT_PYTHON = '04_预实验数据与分析/.analysis_venv/Scripts/python.exe'
-
-class RouteError extends Error {
-  constructor(code, message) {
-    super(message)
-    this.code = code
+export function parseCsv(text) {
+  const result = []; let row = [], value = '', quoted = false
+  for (const char of String(text).replace(/^\uFEFF/, '')) {
+    if (char === '"') { if (quoted === 'escape') { value += '"'; quoted = true } else if (quoted === true) quoted = 'escape'; else if (quoted === false) quoted = true }
+    else if (quoted === true) value += char
+    else { if (quoted === 'escape') quoted = false; if (char === ',') { row.push(value); value = '' } else if (char === '\n') { row.push(value); result.push(row); row = []; value = '' } else if (char !== '\r') value += char }
   }
+  if (value || row.length) { row.push(value); result.push(row) }
+  return result.filter(row => row.some(value => value !== ''))
 }
 
-/* ------------------------------------------------------------------ *
- * io helpers
- * ------------------------------------------------------------------ */
-
-function send(res, status, payload) {
-  const text = JSON.stringify(payload)
-  res.statusCode = status
-  res.setHeader('content-type', 'application/json; charset=utf-8')
-  res.setHeader('cache-control', 'no-store')
-  res.setHeader('x-content-type-options', 'nosniff')
-  res.end(text)
+/** 插件自带的统计后端目录（vendor/site-packages）；存在就优先于运行时的同名包。 */
+const VENDOR_SITE = path.join(HERE, 'vendor', 'site-packages')
+const VENDOR_MANIFEST = path.join(HERE, 'vendor', 'manifest.json')
+function vendorPresent() { return existsSync(VENDOR_SITE) && existsSync(path.join(VENDOR_SITE, 'scipy')) }
+function pythonEnv(cfg) {
+  const env = { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8',
+    ...Object.fromEntries(Object.entries(cfg.adapter?.gateEnvironment || {}).map(([key, name]) => [name, String(key === 'explore' ? cfg.gateExplore ?? 30 : cfg.gateMain ?? 40)])) }
+  if (vendorPresent()) env.PYTHONPATH = [VENDOR_SITE, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
+  return env
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let size = 0
-    const chunks = []
-    req.on('data', chunk => {
-      size += chunk.length
-      if (size > MAX_BODY) {
-        reject(new RouteError('too_large', '请求体过大'))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      if (!chunks.length) return resolve({})
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch {
-        reject(new RouteError('invalid', '请求体不是合法 JSON'))
-      }
-    })
-    req.on('error', reject)
-  })
-}
-
-function sameOrigin(req) {
-  const site = String(req.headers['sec-fetch-site'] || '')
-  if (site && site !== 'same-origin' && site !== 'none') return false
-  const origin = String(req.headers.origin || '')
-  if (!origin) return true
-  try {
-    return new URL(origin).host === String(req.headers.host || '')
-  } catch {
-    return false
-  }
-}
-
-function isId(value) {
-  return /^\d{5}$/.test(String(value || '').trim())
-}
-
-async function exists(target) {
-  try {
-    await stat(target)
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function readJson(target, fallback) {
-  try {
-    return JSON.parse(await readFile(target, 'utf8'))
-  } catch {
-    return fallback
-  }
-}
-
-function resolveConfig(config) {
-  const root = path.resolve(String((config && config.projectRoot) || DEFAULT_PROJECT).replace(/\\/g, '/'))
-  const pythonCandidate = String((config && config.pythonPath) || '').replace(/\\/g, '/')
-  const pythonPath = pythonCandidate || path.join(root, DEFAULT_PYTHON).replace(/\\/g, '/')
-  return {
-    projectRoot: root,
-    labDir: path.resolve(String((config && config.labDir) || 'D:/yyh-lab').replace(/\\/g, '/')),
-    rawDir: path.resolve(String((config && config.rawDir) || path.join(root, '正式实验数据', 'DDT')).replace(/\\/g, '/')),
-    pythonPath,
-    pythonFromConfig: Boolean(pythonCandidate),
-    gateExplore: Number((config && config.gateExplore) || 30),
-    gateMain: Number((config && config.gateMain) || 40)
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * CSV
- * ------------------------------------------------------------------ */
-
-function parseCsv(text) {
-  const source = String(text || '').replace(/^\uFEFF/, '')
-  const rows = []
-  let row = []
-  let cell = ''
-  let quoted = false
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index]
-    if (quoted) {
-      if (char === '"') {
-        if (source[index + 1] === '"') {
-          cell += '"'
-          index += 1
-        } else {
-          quoted = false
-        }
-      } else {
-        cell += char
-      }
-      continue
-    }
-    if (char === '"') {
-      quoted = true
-    } else if (char === ',') {
-      row.push(cell)
-      cell = ''
-    } else if (char === '\n') {
-      row.push(cell)
-      rows.push(row)
-      row = []
-      cell = ''
-    } else if (char !== '\r') {
-      cell += char
-    }
-  }
-  if (cell.length || row.length) {
-    row.push(cell)
-    rows.push(row)
-  }
-  return rows.filter(items => items.length && !(items.length === 1 && items[0] === ''))
-}
-
-function gridToTable(grid) {
-  if (!grid.length) return { columns: [], rows: [] }
-  const [header, ...body] = grid
-  return {
-    columns: header,
-    rows: body.map(items => header.map((_column, index) => items[index] ?? ''))
-  }
-}
-
-async function readTable(target) {
-  try {
-    return gridToTable(parseCsv(await readFile(target, 'utf8')))
-  } catch {
-    return null
-  }
-}
-
-const TABLE_LABEL = {
-  table1_descriptives: '表 1 描述统计',
-  table2_availability: '表 2 数据可用性',
-  table3_qc: '表 3 质控',
-  table4_change: '表 4 T2 − T0 变化',
-  table5_ancova_auc: '表 5 主分析 ANCOVA',
-  table6_simple_effects: '表 6 简单效应',
-  table7_adjusted_means: '表 7 调整均值',
-  table8_ancova_lnk: '表 8 敏感性 ln(k)',
-  table9_missing: '表 9 缺失与完成',
-  table10_completion: '表 10 完成率与超时',
-  table11_distribution: '表 11 分布特征',
-  table12_reliability: '表 12 FTPS 信度',
-  table13_balance: '表 13 基线平衡',
-  table14_nonsystematic: '表 14 非系统折扣',
-  table15_prepilot: '表 15 预实验 DTA',
-  table16_stai_change: '表 16 STAI-S 变化',
-  table17_ftps_lmm: '表 17 FTPS 混合模型',
-  table18_mediation: '表 18 中介分析',
-  table19_trait_anxiety: '表 19 特质焦虑',
-  table20_sensitivity: '表 20 ITT/PP 敏感性'
-}
-
-/* ------------------------------------------------------------------ *
- * python
- * ------------------------------------------------------------------ */
-
-function runPython(cfg, args, timeoutMs = RUN_TIMEOUT_MS) {
+export function python(cfg, script, args, options = {}) {
   return new Promise(resolve => {
-    let child
-    try {
-      child = spawn(cfg.pythonPath, ['-X', 'utf8', path.join(HERE, 'pipeline.py'), ...args], {
-        cwd: HERE,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          PYTHONIOENCODING: 'utf-8',
-          PYTHONUTF8: '1',
-          DDT_GATE_EXPLORE: String(cfg.gateExplore),
-          DDT_GATE_MAIN: String(cfg.gateMain)
-        }
-      })
-    } catch (error) {
-      resolve({ ok: false, error: `无法启动 python：${error && error.message ? error.message : error}` })
-      return
-    }
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    const finish = value => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(value)
-    }
-    const timer = setTimeout(() => {
-      try {
-        child.kill()
-      } catch {
-        /* already gone */
-      }
-      finish({ ok: false, error: `分析超时（${Math.round(timeoutMs / 1000)}s），已中止` })
-    }, timeoutMs)
-    child.stdout.on('data', chunk => {
-      stdout += chunk
-    })
-    child.stderr.on('data', chunk => {
-      stderr += chunk
-    })
-    child.on('error', error => finish({ ok: false, error: `python 启动失败：${error && error.message ? error.message : error}` }))
-    child.on('close', code => {
-      const marker = stdout.lastIndexOf('===JSON===')
-      if (marker === -1) {
-        finish({
-          ok: false,
-          error: (stderr || stdout || `python 退出码 ${code}`).trim().slice(0, 800)
-        })
-        return
-      }
-      const tail = stdout.slice(marker + '===JSON==='.length).trim()
-      try {
-        finish(JSON.parse(tail))
-      } catch {
-        finish({ ok: false, error: '分析输出不是合法 JSON：' + tail.slice(0, 300) })
-      }
-    })
+    let stdout = '', stderr = '', settled = false
+    const child = (options.spawn || spawn)(cfg.pythonPath, ['-X', 'utf8', script, ...args], { cwd: path.dirname(script), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: pythonEnv(cfg) })
+    const finish = result => { if (settled) return; settled = true; clearTimeout(timer); resolve(result) }
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; child.kill() }, options.timeoutMs ?? 15 * 60 * 1000)
+    child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 32 * 1024 * 1024) { timedOut = true; child.kill() } })
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-8000) })
+    child.on('error', error => finish({ ok: false, error: `Python 启动失败：${error.message}` }))
+    child.on('close', code => { if(timedOut){finish({ok:false,error:'分析超时且进程已退出；请查看运行记录后重试。'});return} const marker = stdout.lastIndexOf('===JSON==='); try { if (marker < 0) throw new Error(stderr || `Python 退出码 ${code}`); finish(JSON.parse(stdout.slice(marker + 10).trim())) } catch (error) { finish({ ok: false, error: error.message }) } })
   })
 }
 
-async function pythonReady(cfg) {
-  if (!(await exists(cfg.pythonPath))) {
-    return {
-      ok: false,
-      error: `找不到 python：${cfg.pythonPath}。在插件配置里把 pythonPath 指向装了 pandas / statsmodels 的解释器。`
-    }
+function safeRun(id) { if (!/^[A-Za-z0-9][A-Za-z0-9_-]{3,79}$/.test(id)) throw new AnalysisError('invalid', '运行编号不合法'); return id }
+function configFor(config) {
+  const context = loadStudyContext(config, { pluginKey: 'analysis' })
+  const cfg = { ...context.plugin, ...config }
+  const base = context.baseDir
+  for (const key of ['dataPath', 'pythonPath', 'pipelinePath', 'adapterPath', 'labDir', 'rawDir', 'projectRoot']) if (cfg[key]) cfg[key] = path.resolve(base, cfg[key])
+  cfg.pythonPath ||= 'python'
+  cfg.outputDir = cfg.labDir || path.join(context.dataRoot, 'analysis')
+  if (cfg.adapterPath) {
+    const manifest = JSON.parse(readFileSync(cfg.adapterPath, 'utf8').replace(/^\uFEFF/, ''))
+    if (manifest.schemaVersion !== 1 || typeof manifest.pipelinePath !== 'string') throw new AnalysisError('adapter', 'adapter manifest 需要 schemaVersion:1 和 pipelinePath')
+    cfg.pipelinePath = path.resolve(path.dirname(cfg.adapterPath), manifest.pipelinePath)
+    cfg.adapter = manifest
   }
-  const probe = await runPython(cfg, ['--stage', 'status', '--json'], 60000)
-  if (!probe.ok) return { ok: false, error: probe.error }
-  return { ok: true, python: cfg.pythonPath, payload: probe }
+  if (cfg.pipelinePath) {
+    for (const key of ['projectRoot', 'labDir', 'rawDir']) if (!cfg[key]) throw new AnalysisError('adapter', `私有适配器必须显式配置 ${key}`)
+    cfg.outputDir = cfg.labDir
+  }
+  cfg.outputDir = path.resolve(cfg.outputDir)
+  return { cfg, context }
 }
-
-/* ------------------------------------------------------------------ *
- * plugin
- * ------------------------------------------------------------------ */
 
 export function apply(ctx, config = {}) {
-  const cfg = resolveConfig(config)
-  const runsDir = path.join(cfg.labDir, 'runs')
-  const cacheDir = path.join(cfg.labDir, 'cache')
-  const exclusionsPath = path.join(cfg.labDir, 'exclusions.csv')
-
-  let busy = null
-  let lock = null
-
-  /* ---------------------------- reads ---------------------------- */
-
-  async function listRuns(limit = 20) {
-    let names = []
+  const VERSION = '0.2.0'
+  let selected = configFor(config)
+  function current() { return selected }
+  const binding = hostBinding(ctx, {
+    plugin: 'analysis-run',
+    version: VERSION,
+    config,
+    hooks: {
+      loadStudy: studyPath => configFor({ studyPath, ...(config.pythonPath ? { pythonPath: config.pythonPath } : {}) }).context,
+      currentIdentity: () => ({ studyId: selected.context.id, studyPath: selected.context.path, dataRoot: selected.context.dataRoot, revision: selected.context.revision }),
+      busy: () => LOCKS.size > 0 || WRITES.size > 0,
+      prepareSwitch(studyPath) {
+        if (LOCKS.has(selected.cfg.outputDir) || WRITES.has(selected.cfg.outputDir) || LOCKS.size > 0) throw new AnalysisError('busy', '分析正在运行或保存，暂不能切换研究')
+        const previous = selected
+        const next = configFor({ studyPath, ...(config.pythonPath ? { pythonPath: config.pythonPath } : {}) })
+        return { commit() { selected = next }, rollback() { selected = previous } }
+      }
+    }
+  })
+  binding.dispatch(ctx)
+  async function studyConnect(actor, payload) {
+    if (!path.isAbsolute(String(payload.studyPath || ''))) throw new AnalysisError('invalid', '研究定义需要绝对路径')
+    const view = binding.connect(actor, { studyPath: payload.studyPath })
+    const active = await binding.activate(actor)
+    return { binding: active || view, study: current().context.identity }
+  }
+  async function studySave(actor, payload) {
+    const problems = validateStudyDefinition(payload.definition)
+    if (problems.length) throw new AnalysisError('invalid', problems.join('；'))
+    if (!path.isAbsolute(String(payload.studyPath || ''))) throw new AnalysisError('invalid', '研究定义需要绝对路径')
+    if (LOCKS.size > 0 || WRITES.size > 0) throw new AnalysisError('busy', '分析运行时不能保存研究')
+    // Explicit user action creates a new definition only; existing files are never overwritten.
+    await mkdir(path.dirname(payload.studyPath), { recursive: true })
+    await writeFile(payload.studyPath, JSON.stringify(payload.definition, null, 2), { encoding: 'utf8', flag: 'wx' })
     try {
-      names = (await readdir(runsDir, { withFileTypes: true }))
-        .filter(entry => entry.isDirectory())
-        .map(entry => entry.name)
-        .sort()
-        .reverse()
-    } catch {
-      return []
-    }
-    const runs = []
-    for (const name of names.slice(0, limit)) {
-      const meta = await readJson(path.join(runsDir, name, 'meta.json'), null)
-      if (!meta) continue
-      runs.push({
-        runId: meta.runId || name,
-        startedAt: meta.startedAt,
-        finishedAt: meta.finishedAt,
-        status: meta.status,
-        stages: meta.stages,
-        n: meta.n,
-        dataCutoff: meta.dataCutoff,
-        gate: meta.model && meta.model.gate ? meta.model.gate.level : null,
-        changed: meta.changedSinceLast || null,
-        ms: meta.ms
-      })
-    }
-    return runs
-  }
-
-  async function readExclusions() {
-    try {
-      const grid = parseCsv(await readFile(exclusionsPath, 'utf8'))
-      if (!grid.length) return []
-      const { columns, rows } = gridToTable(grid)
-      if (!columns.includes('编号')) return []
-      return rows.map(items => {
-        const record = {}
-        columns.forEach((column, index) => {
-          record[column] = items[index]
-        })
-        return record
-      })
-    } catch {
-      return []
+      const view = binding.connect(actor, { studyPath: payload.studyPath })
+      const active = await binding.activate(actor)
+      return { binding: active || view, study: current().context.identity }
+    } catch (error) {
+      await rm(payload.studyPath, { force: true }).catch(() => {})
+      throw error
     }
   }
-
-  async function writeExclusions(items) {
-    await mkdir(cfg.labDir, { recursive: true })
-    const header = '编号,原因,时间,操作'
-    const lines = items.map(item => [item['编号'], item['原因'], item['时间'], item['操作']]
-      .map(value => {
-        const text = String(value ?? '')
-        return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text
-      }).join(','))
-    await writeFile(exclusionsPath, '\ufeff' + [header, ...lines].join('\r\n') + '\r\n', 'utf8')
+  async function exclusions(cfg) { return readJson(path.join(cfg.outputDir, 'exclusions.json'), []) }
+  async function planFor(cfg) {
+    const stored = await readJson(path.join(cfg.outputDir, 'plan.json'), null)
+    return stored || { dataPath: cfg.dataPath || '', idColumn: cfg.idColumn || 'participantId', outcome: cfg.outcome || '', layout: cfg.layout || 'wide', groupColumns: cfg.groupColumns || [], covariates: cfg.covariates || [], pairedColumns: cfg.pairedColumns || [], within: cfg.within || null, analyses: cfg.analyses || ['descriptives'], gate: cfg.gate || { minSubjects: cfg.gateMain ?? 30 } }
   }
-
-  async function statusPayload() {
-    const probe = await runPython(cfg, ['--stage', 'status', '--json'], 120000)
-    const runs = await listRuns()
-    const last = runs[0] || null
-    const lastMeta = last ? await readJson(path.join(runsDir, last.runId, 'meta.json'), null) : null
-    return {
-      lastRun: last,
-      lastMeta: lastMeta
-        ? {
-            n: lastMeta.n,
-            changed: lastMeta.changedSinceLast,
-            warnings: lastMeta.warnings || [],
-            failures: lastMeta.failures || [],
-            qc: lastMeta.qc || null,
-            gate: lastMeta.model && lastMeta.model.gate ? lastMeta.model.gate : null,
-            byCell: lastMeta.nByCell || null
-          }
-        : null,
-      runs,
-      newFiles: probe.ok !== false ? probe.newFiles || [] : [],
-      newFileCount: probe.ok !== false ? probe.newFileCount || 0 : 0,
-      rawFileCount: probe.ok !== false ? probe.rawFileCount || 0 : 0,
-      cache: probe.ok !== false ? probe.cache : { trials: false, auc: false },
-      exclusions: await readExclusions(),
-      stages: STAGES.map(stage => ({ id: stage, label: STAGE_LABEL[stage] })),
-      paths: { labDir: cfg.labDir, rawDir: cfg.rawDir, runsDir, python: cfg.pythonPath },
-      python: { ok: probe.ok !== false, error: probe.ok === false ? probe.error : null },
-      pipelineVersion: probe.ok !== false ? probe.pipelineVersion : null,
-      tables: Object.entries(TABLE_LABEL).map(([id, label]) => ({ id, label })),
-      busy
+  function privateArgs(cfg, stage) { return ['--stage', stage, '--json', '--project-root', cfg.projectRoot, '--lab-dir', cfg.labDir, '--raw-dir', cfg.rawDir] }
+  async function privateStatus(cfg) { const out = await python(cfg, cfg.pipelinePath, privateArgs(cfg, 'status')); if (!out.ok) throw new AnalysisError('python', out.error); return out }
+  async function runs(cfg) {
+    let entries; try { entries = await readdir(path.join(cfg.outputDir, 'runs'), { withFileTypes: true }) } catch { return [] }
+    const list = []
+    for (const entry of entries.filter(e => e.isDirectory()).sort((a,b) => b.name.localeCompare(a.name))) {
+      const meta = await readJson(path.join(cfg.outputDir, 'runs', entry.name, 'meta.json'), null)
+      if (!meta || (meta.study && meta.study.id !== current().context.id)) continue
+      // 被中断的运行：仍是 running，但记录里的进程已经不在了。
+      let interrupted = false
+      if (meta.status === 'running' && meta.process && meta.process.hostname === os.hostname() && Number.isInteger(Number(meta.process.pid))) {
+        try { process.kill(Number(meta.process.pid), 0) } catch { interrupted = true }
+      }
+      list.push({ runId: entry.name, status: meta.status, interrupted, n: meta.subjects ?? meta.n, observations: meta.observations, startedAt: meta.startedAt, finishedAt: meta.finishedAt, study: meta.study, error: meta.error, fingerprint: meta.fingerprint })
     }
+    // stale：被更新后、输入不同的运行（只在读取时推导，不改已完成的运行目录）。
+    const newest = list[0]
+    const newestFingerprint = newest && newest.fingerprint
+    for (const row of list) {
+      row.stale = Boolean(newest && row.runId !== newest.runId && row.fingerprint && newestFingerprint && row.fingerprint !== newestFingerprint)
+    }
+    for (const row of list) delete row.fingerprint
+    return list
   }
-
-  async function resultsPayload(runId) {
-    const runs = await listRuns(40)
-    const target = runId || (runs[0] && runs[0].runId)
-    if (!target) return { runId: null, runs, tables: [], report: null, figures: [], meta: null }
-    const runDir = path.join(runsDir, target)
-    const meta = await readJson(path.join(runDir, 'meta.json'), null)
-    if (!meta) throw new RouteError('not_found', `没有这次运行：${target}`)
+  async function schema() {
+    const { cfg, context } = current()
+    return { study: context.identity, mode: cfg.pipelinePath ? 'adapter' : 'generic', modules: MODULES, stages: cfg.pipelinePath ? cfg.adapter?.stages || [{ id: 'all', label: '运行本地分析' }] : [{ id: 'all', label: '运行已选分析' }], plan: cfg.pipelinePath ? null : await planFor(cfg), planRevision: hash(await readFile(path.join(cfg.outputDir, 'plan.json'), 'utf8').catch(() => '')), exclusionsRevision: hash(await readFile(path.join(cfg.outputDir, cfg.pipelinePath ? cfg.adapter?.exclusionsFile || 'exclusions.csv' : 'exclusions.json'), 'utf8').catch(() => '')), adapterName: cfg.adapter?.name || (cfg.pipelinePath ? '本地适配器' : null) }
+  }
+  async function status(_payload = {}, view = null) {
+    const { cfg, context } = current(); const base = await schema(); const history = await runs(cfg)
+    if (cfg.pipelinePath) { const legacy = await privateStatus(cfg); return { ...base, busy: LOCKS.get(cfg.outputDir) || null, runs: history, lastRun: history[0] || null, source: { path: cfg.rawDir, files: legacy.rawFileCount, newFiles: legacy.newFileCount }, validity: legacy.validity || {}, exclusions: legacy.exclusions || [], python: { ok: true }, paths: { outputDir: cfg.outputDir } } }
+    const plan = await planFor(cfg)
+    let source = { path: plan.dataPath, exists: false }
+    if (plan.source && plan.source.type === 'core') {
+      // core 来源：现算一份汇合，以便显示当前数据版本与"有更新待运行"。
+      try {
+        const built = openAnalysis({ data: openResearchData({ study: context, instanceId: view && view.instanceId }), study: context, owner: 'analysis-run' }).dataset({ plan })
+        source = { kind: 'core', exists: true, hash: built.hash, stats: built.stats, columns: built.columns }
+      } catch (error) {
+        source = { kind: 'core', exists: false, error: error.message }
+      }
+    } else {
+      try { const bytes = await readFile(plan.dataPath); source = { ...source, exists: true, sha256: hash(bytes), size: bytes.length, columns: parseCsv(bytes.toString('utf8'))[0] || [] } } catch { /* Missing source is a setup state. */ }
+    }
+    const items = await exclusions(cfg)
+    let latest = null
+    if (history[0]) latest = await readJson(path.join(cfg.outputDir, 'runs', history[0].runId, 'meta.json'), null)
+    // 后端可用性：用最近一次运行记录的环境；没有运行就不知道，返回 null。
+    const CORE_BACKENDS = { descriptives: ['numpy', 'pandas'], sample: ['numpy', 'pandas'], sensitivity: ['numpy', 'pandas'], correlation: ['numpy', 'pandas'], reliability: ['numpy', 'pandas'], ttest: ['numpy', 'pandas'], anova: ['numpy', 'pandas', 'statsmodels'], mediation: ['numpy', 'pandas', 'statsmodels'], script: ['numpy', 'pandas'], regression: ['numpy', 'pandas', 'statsmodels'], paired: ['numpy', 'pandas'], mixed: ['statsmodels'] }
+    let backends = null
+    let backendsSource = vendorPresent() ? 'vendor' : 'runtime'
+    let vendor = { present: vendorPresent(), site: VENDOR_SITE, manifest: existsSync(VENDOR_MANIFEST) ? await readJson(VENDOR_MANIFEST, null) : null }
+    if (latest) {
+      const environment = await readJson(path.join(cfg.outputDir, 'runs', history[0].runId, 'environment.json'), null)
+      if (environment) {
+        backends = Object.fromEntries(Object.entries(CORE_BACKENDS).map(([module, deps]) => {
+          const missing = deps.filter(name => !(environment.packages || {})[name])
+          return [module, { ok: missing.length === 0, missing }]
+        }))
+        const scipyPath = String((environment.packageSources || {}).scipy || '')
+        backendsSource = scipyPath.includes(`${path.sep}vendor${path.sep}`) ? 'vendor' : (scipyPath ? 'runtime' : backendsSource)
+      }
+    }
+    const sourceChanged = plan.source && plan.source.type === 'core'
+      ? (latest?.dataset?.hash || latest?.source?.sha256) !== source.hash
+      : latest?.source?.sha256 !== source.sha256
+    // core 来源的 dataPath 是运行时派生的，不算方案变更。
+    const normalizePlan = value => { const clone = JSON.parse(JSON.stringify(value || {})); delete clone.dataPath; return JSON.stringify(clone) }
+    const pendingChanges = Boolean(latest && (sourceChanged || normalizePlan(latest.plan) !== normalizePlan(plan) || JSON.stringify(latest.excludedIds || []) !== JSON.stringify(items.map(row => row.id).sort())))
+    return { ...base, busy: LOCKS.get(cfg.outputDir) || null, queued: PENDING.has(cfg.outputDir), autoError: autoError || null, autoTicks, backends, backendsSource, vendor, runs: history, lastRun: history[0] || null, source, pendingChanges, exclusions: items, python: { configured: Boolean(cfg.pythonPath) }, paths: { outputDir: cfg.outputDir }, study: context.identity }
+  }
+  async function results(query = {}) {
+    const { cfg, context } = current(); const history = await runs(cfg); const id = String(query.run || query.runId || history[0]?.runId || '')
+    if (!id) return { runId: null, meta: null, tables: [], report: null, figures: [], study: context.identity }
+    const dir = path.join(cfg.outputDir, 'runs', safeRun(id)); const meta = await readJson(path.join(dir, 'meta.json'), null)
+    if (!meta) throw new AnalysisError('not_found', '找不到这次运行')
+    if (meta.study && meta.study.id !== context.id) throw new AnalysisError('study', '运行属于另一项研究')
+    let allowed = meta.tables || []; let valid = { model: true, report: true }
+    if (cfg.pipelinePath) {
+      const legacyArchive = !meta.stageStates
+      if (legacyArchive) {
+        const names = await readdir(path.join(dir,'tables')).catch(()=>[])
+        allowed = names.filter(name=>/^[A-Za-z0-9_-]+\.csv$/.test(name)).map(name=>({key:path.basename(name,'.csv'),label:cfg.adapter?.tableLabels?.[path.basename(name,'.csv')]||path.basename(name,'.csv'),path:`tables/${name}`}))
+        meta.archive = { legacy: true, verified: false, readOnly: true, text: '历史未验证快照，只读；新分析需要运行全部并创建新记录。' }
+        valid = {model:false,report:true}; meta.model = null
+      } else {
+        const probe = await privateStatus(cfg); valid = probe.validity?.[id] || {}
+        allowed = valid.model ? (meta.model?.artifacts || []).filter(file => file.endsWith('.csv')).map(file => ({ key: path.basename(file, '.csv'), label: cfg.adapter?.tableLabels?.[path.basename(file, '.csv')] || path.basename(file, '.csv'), path: `tables/${path.basename(file)}` })) : []
+        if (!valid.model) meta.model = null
+      }
+      meta.validity = valid
+    }
     const tables = []
-    for (const [key, label] of Object.entries(TABLE_LABEL)) {
-      const table = await readTable(path.join(runDir, 'tables', `${key}.csv`))
-      if (table) tables.push({ key, label, ...table })
+    const corrupt = []
+    if (!cfg.pipelinePath) {
+      for (const [relative, expected] of Object.entries(meta.artifactHashes || {})) {
+        const target = path.resolve(dir, relative)
+        if (!target.startsWith(dir + path.sep)) throw new AnalysisError('integrity', '产物路径越界')
+        try { if (hash(await readFile(target)) !== expected) corrupt.push(relative) } catch { corrupt.push(relative) }
+      }
     }
-    let report = null
-    try {
-      report = await readFile(path.join(runDir, 'report.md'), 'utf8')
-    } catch {
-      report = null
+    for (const table of corrupt.length ? [] : allowed) {
+      if (!/^tables\/[A-Za-z0-9_-]+\.csv$/.test(table.path)) continue
+      const grid = parseCsv(await readFile(path.join(dir, table.path), 'utf8'))
+      tables.push({ key: table.key, label: table.label || table.key, columns: grid[0] || [], rows: grid.slice(1) })
     }
+    let report = null; if (valid.report && !corrupt.length) { try { report = await readFile(path.join(dir, 'report.md'), 'utf8') } catch {} }
     let figures = []
+    if (cfg.pipelinePath && valid.report) figures = (meta.figures || []).map(file => ({ name: path.basename(file), url: `${ROUTE}?action=figure&run=${encodeURIComponent(id)}&name=${encodeURIComponent(path.basename(file))}` }))
+    // 07：已导出的排版版本（只列目录，不改 manifest）。
+    let presentations = []
     try {
-      figures = (await readdir(runDir))
-        .filter(name => /\.png$/i.test(name))
-        .map(name => ({ name, url: `${ROUTE}?action=figure&run=${encodeURIComponent(target)}&name=${encodeURIComponent(name)}` }))
-    } catch {
-      figures = []
-    }
-    return { runId: target, runs, meta, tables, report, figures }
+      const root = path.join(dir, 'presentation')
+      const entries = (await readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
+      for (const entry of entries) {
+        const manifest = await readJson(path.join(root, entry.name, 'manifest.json'), null)
+        const files = (await readdir(path.join(root, entry.name), { recursive: true, withFileTypes: true })).filter(item => item.isFile()).map(item => path.relative(path.join(root, entry.name), path.join(item.parentPath || item.path, item.name)).replace(/\\/g, '/'))
+        presentations.push({ revision: Number(entry.name), createdAt: manifest?.createdAt || null, parent: manifest?.parent || null, sourceHash: manifest?.sourceHash || null, files })
+      }
+      presentations.sort((left, right) => right.revision - left.revision)
+    } catch { presentations = [] }
+    return { runId: id, meta, tables, report, figures, presentations, integrity: { ok: !corrupt.length, corrupt }, study: meta.study || context.identity }
   }
-
-  async function runStage(stage, requestedRun) {
-    if (lock) throw new RouteError('busy', '已经有一次分析在跑，等它结束再点')
-    const ok = await pythonReady(cfg)
-    if (!ok.ok) throw new RouteError('python', ok.error)
-    lock = { stage, startedAt: new Date().toISOString() }
-    busy = { stage, startedAt: lock.startedAt }
+  async function savePlan(payload) {
+    const { cfg } = current(); if (cfg.pipelinePath) throw new AnalysisError('adapter', '本地适配器方案由其配置管理')
+    const plan = payload.plan || payload
+    if (!plan || typeof plan !== 'object' || Array.isArray(plan)) throw new AnalysisError('invalid', '分析方案需要对象')
+    const coreSource = Boolean(plan.source && plan.source.type === 'core')
+    if (!coreSource && (!plan.dataPath || !path.isAbsolute(plan.dataPath))) throw new AnalysisError('invalid', '数据路径需要绝对路径（或把 source.type 设为 core 从研究核心汇合）')
+    const file = path.join(cfg.outputDir, 'plan.json')
+    const previous = await readFile(file, 'utf8').catch(() => '')
+    if (payload.revision !== hash(previous)) throw new AnalysisError('conflict', '方案已变更，请刷新后再保存')
+    await atomicJson(file, plan)
+    return { saved: true, plan, revision: hash(JSON.stringify(plan, null, 2)) }
+  }
+  const PENDING = new Map()
+  /** 同一个输出目录只跑一个分析；期间到来的请求合并成"最新请求"，完成后再补跑一次。 */
+  async function requestRun(payload, state, view) {
+    const { cfg } = state
+    if (LOCKS.has(cfg.outputDir) || WRITES.has(cfg.outputDir)) {
+      PENDING.set(cfg.outputDir, { payload, state, view })
+      return { queued: true, message: '已有分析在运行：已合并为最新请求，完成后再补跑' }
+    }
+    return await run(payload, state, view)
+  }
+  async function run(payload = {}, state = current(), view = null) {
+    const { cfg, context } = state; if (LOCKS.has(cfg.outputDir) || WRITES.has(cfg.outputDir)) throw new AnalysisError('busy', '当前研究已有分析在运行')
+    LOCKS.set(cfg.outputDir, { stage: payload.stage || 'all', startedAt: new Date().toISOString() })
     try {
-      const args = ['--stage', stage, '--json', '--project-root', cfg.projectRoot, '--lab-dir', cfg.labDir,
-        '--raw-dir', cfg.rawDir]
-      if (stage !== 'all') {
-        // 单跑一个阶段：并进那一次运行（面板给的那次，否则最近一次），保留数据集与表格
-        let runId = /^[\w-]{6,40}$/.test(String(requestedRun || '')) ? String(requestedRun) : ''
-        if (!runId) {
-          const latest = await listRuns(1)
-          runId = latest.length ? latest[0].runId : ''
+      let result
+      if (cfg.pipelinePath) {
+        const stage = String(payload.stage || 'all'); const stages = cfg.adapter?.stages?.map(row => row.id) || ['all']
+        if (stage !== 'all' && !stages.includes(stage)) throw new AnalysisError('stage', '适配器不支持该阶段')
+        const args = privateArgs(cfg, stage)
+        if (payload.runId && stage !== 'all') {
+          const old = await readJson(path.join(cfg.outputDir,'runs',safeRun(payload.runId),'meta.json'),null)
+          if (!old?.stageStates) throw new AnalysisError('legacy_archive','历史运行是只读未验证归档，请运行全部创建新记录')
+          args.push('--run-id', safeRun(payload.runId))
         }
-        if (runId) args.push('--run-id', runId)
+        result = await python(cfg, cfg.pipelinePath, args)
+      } else {
+        let plan = payload.plan || await planFor(cfg)
+        if (payload.stage && payload.stage !== 'all') { if (!MODULES.some(row => row.id === payload.stage)) throw new AnalysisError('stage', '未知分析模块'); plan.analyses = ['descriptives', payload.stage].filter((id,i,a) => a.indexOf(id) === i) }
+        let dataset = null
+        if (plan.source && plan.source.type === 'core') {
+          // 从已提交代次汇合分析表（不读旧 CSV 镜像），写进输出目录的 datasets/ 并按 hash 复用。
+          const built = (() => {
+            try {
+              return openAnalysis({ data: openResearchData({ study: context, instanceId: view && view.instanceId }), study: context, owner: 'analysis-run' }).dataset({ plan })
+            } catch (error) {
+              if (error instanceof CoreAnalysisError) throw new AnalysisError(error.code, error.message, error.details)
+              throw error
+            }
+          })()
+          const datasetsDir = path.join(cfg.outputDir, 'datasets')
+          await mkdir(datasetsDir, { recursive: true })
+          const key = built.hash.slice(0, 16)
+          const csvPath = path.join(datasetsDir, `${key}.csv`)
+          const manifestPath = path.join(datasetsDir, `${key}.manifest.json`)
+          const escape = value => { const text = value === null || value === undefined ? '' : String(value); return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text }
+          const csv = [built.columns.join(','), ...built.rows.map(row => built.columns.map(column => escape(row[column])).join(','))].join('\n') + '\n'
+          await writeFile(csvPath, csv, 'utf8')
+          await writeFile(manifestPath, JSON.stringify({ ...built.manifest, hash: built.hash }, null, 2), 'utf8')
+          dataset = { type: 'core', key, path: csvPath, manifestPath, hash: built.hash, stats: built.stats }
+          plan = { ...plan, dataPath: csvPath }
+        }
+        const codeDir = await mkdtemp(path.join(os.tmpdir(), 'analysis-code-'))
+        try {
+          const names = ['engine.py','index.js','client.js','study-context.mjs','study-selection.mjs']
+          for (const name of names) {
+            const source = path.join(HERE,name), bytes = await readFile(source)
+            if (LOADED_HASHES[name] && hash(bytes) !== LOADED_HASHES[name]) throw new AnalysisError('code_changed', '已加载代码与磁盘版本不同，请重新加载插件后运行')
+            await copyFile(source,path.join(codeDir,name))
+            if (hash(await readFile(path.join(codeDir,name))) !== hash(bytes)) throw new AnalysisError('code_changed', '代码快照期间文件变化，请重试')
+          }
+          const request = { action: 'run', study: context.identity, plan, outputDir: cfg.outputDir, exclusions: await exclusions(cfg), revisionOf: payload.runId || null, scriptPaths: names.filter(name=>name!=='engine.py').map(name=>path.join(codeDir,name)) }
+          if (dataset) request.dataset = dataset
+          result = await python(cfg, path.join(codeDir, 'engine.py'), ['--request-json', JSON.stringify(request)])
+        } finally { if (path.dirname(codeDir) !== os.tmpdir() || !path.basename(codeDir).startsWith('analysis-code-')) throw new AnalysisError('path', '临时代码路径校验失败'); await rm(codeDir,{recursive:true,force:true}) }
       }
-      const payload = await runPython(cfg, args)
-      if (!payload.ok) {
-        throw new RouteError('run_failed', payload.error || (payload.failures && payload.failures[0] && payload.failures[0].error) || '分析失败')
-      }
-      return payload
+      if (!result.ok) throw new AnalysisError('run_failed', result.error || result.failures?.[0]?.error || '分析失败', { runId: result.runId })
+      return result
     } finally {
-      lock = null
-      busy = null
+      LOCKS.delete(cfg.outputDir)
+      const next = PENDING.get(cfg.outputDir)
+      if (next) {
+        PENDING.delete(cfg.outputDir)
+        // 补跑用排队时的研究身份，但数据在真正开始时重新汇合，不会混用旧版本。
+        setImmediate(() => { run(next.payload, next.state, next.view).catch(() => {}) })
+      }
+    }
+  }
+  async function exclude(payload) {
+    const { cfg, context } = current(); const id = String(payload.id || '')
+    if (!context.acceptsId(id)) throw new AnalysisError('invalid', '参与者编号不符合研究定义')
+    if (!['add','remove'].includes(payload.op)) throw new AnalysisError('invalid', '排除操作需要 add 或 remove')
+    const revisionFile = path.join(cfg.outputDir, cfg.pipelinePath ? cfg.adapter?.exclusionsFile || 'exclusions.csv' : 'exclusions.json')
+    if (payload.revision !== hash(await readFile(revisionFile, 'utf8').catch(() => ''))) throw new AnalysisError('conflict', '排除名单已变更，请刷新后再保存')
+    if (cfg.pipelinePath) {
+      const file = path.join(cfg.labDir, cfg.adapter?.exclusionsFile || 'exclusions.csv')
+      const keysConfigured = cfg.adapter?.exclusionColumns
+      if (!keysConfigured) throw new AnalysisError('adapter', '适配器需要 exclusionColumns')
+      const grid = parseCsv(await readFile(file, 'utf8').catch(() => Object.values(keysConfigured).join(',') + '\n')); const header = grid[0]
+      const keys = cfg.adapter?.exclusionColumns
+      if (!keys || !header.includes(keys.id)) throw new AnalysisError('adapter', '适配器需要有效的 exclusionColumns 映射')
+      const rows = grid.slice(1).filter(row => row[header.indexOf(keys.id)] !== id)
+      if (payload.op !== 'remove') { if (!String(payload.reason || '').trim()) throw new AnalysisError('invalid', '请填写排除理由'); const record = { [keys.id]: id, [keys.reason]: payload.reason, [keys.at]: new Date().toISOString(), [keys.actor]: 'analysis-run' }; rows.push(header.map(col => record[col] || '')) }
+      const csv = [header,...rows].map(row => row.map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n')+'\n'
+      await mkdir(cfg.labDir,{recursive:true}); await writeFile(file,csv,'utf8'); return { id, pendingChanges: true }
+    }
+    const items = (await exclusions(cfg)).filter(row => row.id !== id)
+    if (payload.op !== 'remove') { if (!String(payload.reason || '').trim()) throw new AnalysisError('invalid', '请填写排除理由'); items.push({ id, reason: String(payload.reason).trim(), at: new Date().toISOString() }) }
+    await atomicJson(path.join(cfg.outputDir, 'exclusions.json'), items)
+    return { id, pendingChanges: true }
+  }
+  const queries = { schema, status, results, preview: planPreview }
+  const READ_ACTIONS = new Set(['schema', 'status', 'results', 'preview'])
+
+  /** 方案向导的预览：返回列名与各模块可用人数，不写任何文件。 */
+  async function planPreview(payload = {}) {
+    const { cfg } = current()
+    const raw = payload.plan || payload
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new AnalysisError('invalid', '分析方案需要对象')
+    const plan = JSON.parse(JSON.stringify(raw))
+    if (!plan.dataPath) throw new AnalysisError('invalid', '还没有选择数据文件')
+    const codeDir = await mkdtemp(path.join(os.tmpdir(), 'analysis-preview-'))
+    try {
+      await copyFile(path.join(HERE, 'engine.py'), path.join(codeDir, 'engine.py'))
+      const request = { action: 'preview', study: current().context.identity, plan }
+      const result = await python(cfg, path.join(codeDir, 'engine.py'), ['--request-json', JSON.stringify(request)])
+      if (!result.ok) throw new AnalysisError('preview_failed', result.error || '预览失败')
+      return result
+    } finally {
+      if (path.basename(codeDir).startsWith('analysis-preview-')) await rm(codeDir, { recursive: true, force: true })
     }
   }
 
-  async function figureFile(runId, name) {
-    if (!/^[\w.-]+\.png$/i.test(String(name || ''))) throw new RouteError('invalid', '文件名不合法')
-    if (!/^[\w-]{6,40}$/.test(String(runId || ''))) throw new RouteError('invalid', 'runId 不合法')
-    const target = path.join(runsDir, runId, name)
-    if (!(await exists(target))) throw new RouteError('not_found', '没有这张图')
-    return target
+  function withFigureUrls(data, actor) {
+    if (!data || !Array.isArray(data.figures)) return data
+    const pageId = actor.kind === 'page' ? actor.pageId : ''
+    data.figures = data.figures.map(figure => ({ ...figure, url: figure.url + '&pageId=' + encodeURIComponent(pageId) }))
+    return data
   }
 
-  /* ---------------------------- actions ---------------------------- */
-
-  const actions = {
-    async status() {
-      return statusPayload()
-    },
-    async results(query) {
-      return resultsPayload(String((query && query.run) || ''))
-    },
-    async run(payload) {
-      const stage = String((payload && payload.stage) || 'all')
-      if (stage !== 'all' && !STAGES.includes(stage)) throw new RouteError('invalid', `未知阶段：${stage}`)
-      const result = await runStage(stage, payload && payload.runId)
-      return {
-        runId: result.runId,
-        runDir: result.runDir,
-        stages: result.stages,
-        n: result.n,
-        gate: result.gate,
-        report: result.report,
-        tables: result.tables,
-        changed: result.changed,
-        failures: result.failures,
-        summaryText: result.summaryText,
-        ms: result.ms
-      }
-    },
-    async exclude(payload) {
-      const op = String((payload && payload.op) || 'add')
-      const id = String((payload && payload.id) || '').trim()
-      if (!isId(id)) throw new RouteError('invalid', '被试编号应为 5 位数字')
-      const items = await readExclusions()
-      const rest = items.filter(item => String(item['编号'] || '').trim() !== id)
-      if (op === 'remove') {
-        await writeExclusions(rest)
-        return { id, removed: true, items: await readExclusions() }
-      }
-      const reason = String((payload && payload.reason) || '').trim()
-      if (!reason) throw new RouteError('invalid', '排除必须写理由：排除规则由人定，脚本只执行')
-      rest.push({ 编号: id, 原因: reason, 时间: new Date().toISOString().slice(0, 10), 操作: '面板' })
-      await writeExclusions(rest)
-      return { id, reason, items: await readExclusions() }
-    },
-    async reveal(payload) {
-      const runId = String((payload && payload.run) || '')
-      const dir = /^[\w-]{6,40}$/.test(runId) ? path.join(runsDir, runId) : cfg.labDir
-      await mkdir(dir, { recursive: true }).catch(() => {})
-      const child = spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore' })
-      child.unref()
-      return { opened: dir }
+  async function action(actor, name, payload = {}) {
+    if (name === 'capabilities') {
+      await binding.read(actor, () => null)
+      return { ...binding.capabilities(actor), study: current().context.identity }
     }
+    if (name === 'autoTick') { await autoTick(); return { ticked: true } }
+    if (name === 'studyConnect') return await studyConnect(actor, payload)
+    if (name === 'studySave') return await studySave(actor, payload)
+    if (!Object.hasOwn(queries, name) && !['plan', 'run', 'exclude', 'export'].includes(name)) throw new AnalysisError('action', '未知操作')
+    const expected = { token: payload.binding || payload.bindingToken, studyId: payload.studyId, studyRevision: payload.studyRevision }
+    if (READ_ACTIONS.has(name)) {
+      const { binding: view, data } = await binding.read(actor, async (_view) => {
+        const value = await queries[name](payload, _view)
+        return name === 'results' ? withFigureUrls(value, actor) : value
+      })
+      return { ...data, binding: view, study: current().context.identity }
+    }
+    if (name === 'export') {
+      const { binding: view, data } = await binding.write(actor, expected, async (_view, state) => { const value = await exportRun(payload); return { ...value, binding: undefined } }, { holdLock: false, capture: () => current() })
+      return { ...data, binding: view, study: current().context.identity }
+    }
+    if (name === 'run') {
+      // 分析可能运行十几分钟：切换在锁内完成，运行在锁外，期间由 LOCKS 阻止切走。
+    const { binding: view, data } = await binding.write(actor, expected, async (_view, state) => requestRun(payload, state, _view), { holdLock: false, capture: () => current() })
+      return { ...data, binding: view, study: current().context.identity }
+    }
+    const { binding: view, data } = await binding.write(actor, expected, async () => {
+      const { cfg } = current()
+      if (name === 'plan') return await serialWrite(cfg.outputDir, () => savePlan(payload))
+      return await serialWrite(cfg.outputDir, () => exclude(payload))
+    })
+    return { ...data, binding: view, study: current().context.identity }
   }
 
   const handler = async (req, res) => {
-    const url = new URL(req.url || ROUTE, 'http://localhost')
-    // <img> 带不了自定义头：图片只读、同源，按 sameOrigin 单独放行
-    const isFigure = req.method === 'GET' && url.searchParams.get('action') === 'figure'
-    if (!sameOrigin(req) || (!isFigure && req.headers[HEADER] !== '1')) {
-      send(res, 403, { ok: false, error: { code: 'forbidden', message: '拒绝跨站访问分析接口' } })
-      return
-    }
+    const respond = (code, payload) => { res.statusCode = code; res.setHeader('content-type', 'application/json; charset=utf-8'); res.setHeader('cache-control', 'no-store'); res.end(JSON.stringify(payload)) }
     try {
-      if (req.method === 'GET') {
-        const action = url.searchParams.get('action') || 'status'
-        if (action === 'figure') {
-          const target = await figureFile(url.searchParams.get('run'), url.searchParams.get('name'))
-          const body = await readFile(target)
-          res.statusCode = 200
-          res.setHeader('content-type', 'image/png')
-          res.setHeader('content-length', String(body.length))
-          res.setHeader('cache-control', 'no-cache')
-          res.end(body)
-          return
-        }
-        const run = actions[action]
-        if (!run) throw new RouteError('unknown_action', '未知操作：' + action)
-        const data = await run(Object.fromEntries(url.searchParams.entries()))
-        send(res, 200, { ok: true, data })
-        return
+      const url = new URL(req.url || ROUTE, 'http://localhost'); const origin = req.headers.origin
+      const figure = req.method === 'GET' && url.searchParams.get('action') === 'figure'
+      const presentation = req.method === 'GET' && url.searchParams.get('action') === 'presentation'
+      if ((req.headers['sec-fetch-site'] && !['same-origin','none'].includes(req.headers['sec-fetch-site'])) || (origin && new URL(origin).host !== req.headers.host) || (!figure && !presentation && req.headers['x-analysis-run'] !== '1')) throw new AnalysisError('forbidden', '拒绝跨站访问')
+      if (presentation) {
+        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId') })
+        const { binding: view, data: result } = await binding.read(actor, () => results({ run: url.searchParams.get('run') }))
+        void view
+        const revision = String(url.searchParams.get('rev') || '')
+        const file = String(url.searchParams.get('file') || '')
+        if (!/^\d+$/.test(revision) || !/^(report\.(html|pdf)|results\.json|manifest\.json|tables\.(docx|xlsx)|figures\/[\w-]+\.(svg|png))$/.test(file)) throw new AnalysisError('not_found', '导出文件不可用')
+        if (!(result.presentations || []).some(item => String(item.revision) === revision && item.files.includes(file))) throw new AnalysisError('not_found', '导出文件不可用')
+        const { cfg } = current()
+        const target = path.join(cfg.outputDir, 'runs', result.runId, 'presentation', revision, file)
+        const media = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.pdf') ? 'application/pdf' : file.endsWith('.svg') ? 'image/svg+xml' : file.endsWith('.png') ? 'image/png'
+          : file.endsWith('.docx') ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : file.endsWith('.xlsx') ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'application/json; charset=utf-8'
+        res.statusCode = 200
+        res.setHeader('content-type', media)
+        res.setHeader('cache-control', 'no-store')
+        if (file.endsWith('.html')) res.setHeader('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
+        // 应用内新标签页会被拦截：PDF 直接以下载方式返回，HTML 允许 iframe 预览。
+        if (file.endsWith('.pdf')) res.setHeader('content-disposition', 'attachment; filename="report.pdf"')
+        res.setHeader('x-content-type-options', 'nosniff')
+        res.end(await readFile(target)); return
       }
-      if (req.method !== 'POST') throw new RouteError('method', '只接受 GET 与 POST')
-      const body = await readBody(req)
-      const action = String(body.action || url.searchParams.get('action') || '')
-      const run = actions[action]
-      if (!run) throw new RouteError('unknown_action', '未知操作：' + action)
-      const data = await run(body.payload || body || {})
-      send(res, 200, { ok: true, data })
-    } catch (error) {
-      const status = error instanceof RouteError ? (error.code === 'not_found' ? 404 : 400) : 500
-      if (status >= 500) console.error('[analysis-run]', error)
-      send(res, status, {
-        ok: false,
-        error: {
-          code: error && error.code ? error.code : 'error',
-          message: String(error && error.message ? error.message : error)
-        }
-      })
+      if (figure) {
+        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId') })
+        const name = url.searchParams.get('name')
+        const { binding: view, data: result } = await binding.read(actor, () => results({ run: url.searchParams.get('run') }))
+        void view
+        if (!result.figures.some(row => row.name === name) || !/^[\w.-]+\.png$/i.test(name)) throw new AnalysisError('not_found','图片不可用或已过期')
+        const { cfg } = current(); res.setHeader('content-type','image/png'); res.end(await readFile(path.join(cfg.outputDir,'runs',result.runId,name))); return
+      }
+      let name, payload
+      if (req.method === 'GET') { name = url.searchParams.get('action') || 'status'; payload = Object.fromEntries(url.searchParams) ; if (!['status','schema','results','capabilities'].includes(name)) throw new AnalysisError('method','此操作需要 POST') }
+      else if (req.method === 'POST') {
+        let body = ''; for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 1024*1024) throw new AnalysisError('invalid','请求体过大') }
+        const parsed = JSON.parse(body || '{}'); name = parsed.action; payload = parsed.payload || {}
+      } else throw new AnalysisError('method','只接受 GET / POST')
+      const actor = binding.pageActor({ req, pageId: payload.pageId })
+      respond(200,{ok:true,data:await action(actor, name, payload)})
+    } catch(error) {
+      const mapped = bindingStatus(error)
+      respond(mapped || (error.code==='not_found'?404:error.code==='forbidden'?403:400),{ok:false,error:{code:error.code||'error',message:error.message,details:error.details}})
     }
   }
-
-  const webServer = ctx.get ? ctx.get('webServer') : undefined
-  if (webServer) {
-    ctx.effect(() => webServer.register({ kind: 'prefix', path: ROUTE, handler }), 'analysis-run: http route')
-  } else {
-    ctx.inject(['webServer'], scope => {
-      scope.effect(
-        () => scope.webServer.register({ kind: 'prefix', path: ROUTE, handler }),
-        'analysis-run: http route'
-      )
-    })
-  }
-
-  /* ---------------------------- tools ---------------------------- */
-
-  const textOutput = {
-    schema: {
-      type: 'object',
-      properties: { text: { type: 'string' } },
-      required: ['text'],
-      additionalProperties: false
-    },
-    render: (_args, value) => [{ type: 'text', text: value.text }]
-  }
-
-  function gateLine(gate) {
-    if (!gate) return '门禁：还没跑过模型阶段。'
-    return `门禁：${gate.text || gate.level}`
-  }
-
-  const registerTools = scope => {
+  /* ---------- 07 导出：结果对象 → 三线表 / 图 / HTML / PDF / manifest ---------- */
+  async function exportRun(payload = {}) {
+    const { cfg, context } = current()
+    if (cfg.pipelinePath) throw new AnalysisError('adapter', '通用导出只支持通用引擎运行；私有适配器有自己的报告流程')
+    const data = await results(payload)
+    if (!data.runId) throw new AnalysisError('not_found', '还没有可导出的运行')
+    if (!data.integrity || !data.integrity.ok) throw new AnalysisError('integrity', '运行产物校验失败，不能导出')
+    const runId = safeRun(data.runId)
+    const runDir = path.join(cfg.outputDir, 'runs', runId)
+    const root = path.join(runDir, 'presentation')
+    const previous = existsSync(root) ? (await readdir(root, { withFileTypes: true })).filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name)).map(entry => Number(entry.name)).sort((a, b) => a - b).pop() : null
+    const revision = (previous || 0) + 1
+    const outDir = path.join(root, String(revision))
+    await mkdir(outDir, { recursive: true })
+    const built = buildResults({ run: { runId }, meta: data.meta, tables: data.tables.map(table => tableFromGrid(table)) })
+    const figures = []
+    const figureFiles = []
+    const addFigure = async (key, chart) => {
+      if (!chart || chart.ok === false) return
+      figureFiles.push({ key, width: chart.width, height: chart.height })
+      built.figures.push({ key, title: chart.title || key, svg: `figures/${key}.svg`, width: chart.width, height: chart.height })
+      await writeFile(path.join(outDir, 'figures', `${key}.svg`), chart.svg)
+      const png = renderPng({ svg: chart.svg, outPath: path.join(outDir, 'figures', `${key}.png`), width: chart.width, height: chart.height, dpi: 300 })
+      if (png.ok) figures.push({ key, png: `figures/${key}.png`, dpi: png.dpi })
+    }
+    await mkdir(path.join(outDir, 'figures'), { recursive: true })
+    const descriptives = built.tables.find(table => table.key === 'descriptives')
+    const dataTable = built.tables.find(table => table.key === 'data' || table.key === 'merged' || table.key === 'model')
+    if (descriptives && descriptives.columns.some(column => column.key === 'mean')) {
+      const labelColumn = descriptives.columns.find(column => !['subjects', 'n', 'mean', 'sd', 'se', 'median', 'q1', 'q3', 'iqr', 'minimum', 'maximum', 'valueRange', 'ciLow', 'ciHigh', 'missing'].includes(column.key))?.key
+      const chart = pointRangeChart({
+        title: '分组估计与 95% 区间', subtitle: `分析集 ${built.analysisSet.subset} · 独立人数 ${built.analysisSet.subjects ?? '—'}`, height: 420,
+        rows: descriptives.rows.map(row => ({ label: labelColumn ? String(row[labelColumn]) : '整体', estimate: row.mean, low: row.ciLow, high: row.ciHigh, n: row.subjects ?? row.n })),
+      })
+      await addFigure('group-estimates', chart)
+      // 分布图：直接用本次运行快照的 input.csv（原始观测，不分箱重算统计量）。
+      try {
+        const grid = parseCsv(await readFile(path.join(runDir, 'input.csv'), 'utf8'))
+        const header = grid[0] || []
+        const outcome = data.meta?.plan?.outcome || ''
+        const valueIndex = header.indexOf(outcome)
+        const labelIndex = labelColumn ? header.indexOf(String(labelColumn)) : -1
+        if (valueIndex >= 0) {
+          const grouped = new Map()
+          for (const row of grid.slice(1)) {
+            const value = Number(row[valueIndex])
+            if (!Number.isFinite(value)) continue
+            const key = labelIndex >= 0 ? String(row[labelIndex] || '—') : '整体'
+            if (!grouped.has(key)) grouped.set(key, [])
+            grouped.get(key).push(value)
+          }
+          const groups = [...grouped.entries()].slice(0, 6).map(([label, values]) => ({ label, values }))
+          if (groups.length) await addFigure('distribution', distributionChart({ title: '原始观测分布', subtitle: `${outcome} · 每组一个散点条带 + 箱线`, groups, height: 460 }))
+        }
+      } catch { /* 快照缺失或读不了就不画分布图，不编造数据 */ }
+    }
+    const coefficientTable = built.tables.find(table => table.key === 'coefficients') || built.tables.find(table => table.key === 'regression' && table.columns.some(column => column.key === 'term') && table.columns.some(column => column.key === 'estimate'))
+    if (coefficientTable) {
+      await addFigure('model-estimates', forestChart({ title: '模型估计与 95% 区间', height: 360, rows: coefficientTable.rows.map(row => ({ label: String(row.term), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }))
+    }
+    const contrastTable = built.tables.find(table => table.key === 'contrasts') || built.tables.find(table => table.key === 'contrast')
+    if (contrastTable && contrastTable.columns.some(column => column.key === 'estimate')) {
+      await addFigure('planned-contrasts', forestChart({ title: '预设对比', height: 340, rows: contrastTable.rows.map(row => ({ label: String(row.name ?? row.term ?? '对比'), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }))
+    }
+    // 配对轨迹：从运行快照重建逐人前后值（宽表配对列，或长表的两个 within 水平）。
     try {
-      if (!scope.tools || typeof scope.tools.register !== 'function') return
-
-      scope.tools.register({
-        name: 'analysis_status',
-        description: '查看 DDT 分析直通的状态：上次运行（runId、n、数据截止、门禁）、新到的原始文件、缓存与排除名单。只读，不改数据。',
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
-        output: textOutput,
-        async execute() {
-          const status = await statusPayload()
-          const last = status.lastRun
-          const lines = []
-          if (!last) {
-            lines.push('还没有运行过分析。点了「全部」或调用 analysis_run 才会生成第一次结果。')
-          } else {
-            lines.push(`上次运行：${last.runId}（${last.startedAt || ''}${last.ms ? '，' + Math.round(last.ms / 1000) + ' s' : ''}）`)
-            lines.push(`n = ${last.n ?? '?'}，数据截止 ${last.dataCutoff || '?'}；阶段：${(last.stages || []).join(' → ')}`)
-            lines.push(gateLine(status.lastMeta && status.lastMeta.gate))
-            const changed = (status.lastMeta && status.lastMeta.changed) || last.changed
-            if (changed && changed.newSubjects && changed.newSubjects.length) {
-              lines.push(`比上次新增被试：${changed.newSubjects.join('、')}`)
-            }
-            if (changed && changed.interactionP) {
-              const p = changed.interactionP
-              lines.push(`关键检验 p：${p.before} → ${p.now}`)
-            }
-            const qc = status.lastMeta && status.lastMeta.qc
-            if (qc) {
-              lines.push(`质控：${qc.n_trials} 试次 / ${qc.n_points} 个无差异点；异常格 ${qc.bad_cells}，缺失 IP ${qc.missing_ip}，k 在边界 ${qc.k_at_bound}；超时 ${qc.timeout_trials} 试次`)
-            }
+      const plan = data.meta?.plan || {}
+      const grid = parseCsv(await readFile(path.join(runDir, 'input.csv'), 'utf8'))
+      const header = grid[0] || []
+      const idIndex = header.indexOf(plan.idColumn || '')
+      const pairs = []
+      if (idIndex >= 0 && Array.isArray(plan.pairedColumns) && plan.pairedColumns.length === 2) {
+        const beforeIndex = header.indexOf(plan.pairedColumns[0]); const afterIndex = header.indexOf(plan.pairedColumns[1])
+        if (beforeIndex >= 0 && afterIndex >= 0) {
+          for (const row of grid.slice(1)) {
+            const before = Number(row[beforeIndex]); const after = Number(row[afterIndex])
+            if (Number.isFinite(before) && Number.isFinite(after)) pairs.push({ id: row[idIndex], before, after })
           }
-          lines.push(`原始文件 ${status.rawFileCount} 个，新到 ${status.newFileCount} 个${status.newFileCount ? '（' + status.newFiles.slice(0, 6).join('、') + (status.newFiles.length > 6 ? ' 等' : '') + '）' : ''}。`)
-          lines.push(`缓存：${status.cache.trials ? '有' : '无'}逐试次长表 / ${status.cache.auc ? '有' : '无'} AUC 宽表。排除名单 ${status.exclusions.length} 人。`)
-          if (!status.python.ok) lines.push(`python 不可用：${status.python.error}`)
-          return { text: lines.join('\n') }
+          await addFigure('paired-trajectories', pairedChart({ title: '配对变化轨迹', subtitle: `${plan.pairedColumns[0]} → ${plan.pairedColumns[1]} · 每位参与者一条线`, pairs, beforeLabel: plan.pairedColumns[0], afterLabel: plan.pairedColumns[1], height: 460 }))
         }
-      })
-
-      scope.tools.register({
-        name: 'analysis_run',
-        description: '跑 DDT 分析直通管线。stage=all 依次跑五个阶段；也可以单跑 ingest / derive / merge / model / report。完成后返回 runId、n、门禁结论与结果位置。结果写在 _lab/runs/<runId>/。',
-        parameters: {
-          type: 'object',
-          properties: {
-            stage: {
-              type: 'string',
-              enum: ['all', 'ingest', 'derive', 'merge', 'model', 'report'],
-              description: 'all=五阶段全跑；单阶段只重算那一步（缓存键不够时会提示先跑前一步）'
-            }
-          },
-          additionalProperties: false
-        },
-        output: textOutput,
-        async execute(args) {
-          const stage = String((args && args.stage) || 'all')
-          if (stage !== 'all' && !STAGES.includes(stage)) throw new Error(`未知阶段：${stage}`)
-          const result = await runStage(stage)
-          const lines = [result.summaryText, '', `结果目录：${result.runDir}`]
-          if (result.tables && result.tables.length) lines.push(`三线表：${result.tables.length} 张（tables/）`)
-          if (result.report) lines.push(`报告：${result.report}`)
-          return { text: lines.join('\n') }
+      } else if (idIndex >= 0 && plan.within?.column && Array.isArray(plan.within.levels) && plan.within.levels.length === 2) {
+        const valueIndex = header.indexOf(plan.outcome || ''); const levelIndex = header.indexOf(plan.within.column)
+        if (valueIndex >= 0 && levelIndex >= 0) {
+          const byId = new Map()
+          for (const row of grid.slice(1)) {
+            const value = Number(row[valueIndex]); const level = row[levelIndex]
+            const id = row[idIndex]
+            if (!Number.isFinite(value) || !id) continue
+            if (!byId.has(id)) byId.set(id, {})
+            byId.get(id)[level] = value
+          }
+          for (const [id, levels] of byId) if (Number.isFinite(levels[plan.within.levels[0]]) && Number.isFinite(levels[plan.within.levels[1]])) pairs.push({ id, before: levels[plan.within.levels[0]], after: levels[plan.within.levels[1]] })
+          if (pairs.length) await addFigure('paired-trajectories', pairedChart({ title: '配对变化轨迹', subtitle: `${plan.within.levels[0]} → ${plan.within.levels[1]} · 每位参与者一条线`, pairs, beforeLabel: plan.within.levels[0], afterLabel: plan.within.levels[1], height: 460 }))
         }
-      })
+      }
+    } catch { /* 快照读不了就不画轨迹图，不编造数据 */ }
+    const figureHtml = built.figures.map((figure, index) => {
+      // 内联进 HTML 时去掉 SVG 命名空间（HTML5 不需要，也让报告里没有任何 http 引用）。
+      const svg = readFileSync(path.join(outDir, figure.svg), 'utf8').replace(/\sxmlns="http:\/\/www\.w3\.org\/2000\/svg"/, '')
+      const png = figures.find(item => item.key === figure.key)
+      return `<figure class="chart" data-figure="${escapeAttr(figure.key)}">${svg}<figcaption>图 ${index + 1} ${escapeAttr(figure.title || figure.key)}${png ? ` · PNG 300dpi：${escapeAttr(png.png)}` : ''}</figcaption></figure>`
+    }).join('\n')
+    const html = renderHtmlReport({ meta: data.meta, results: built, today: new Date().toISOString().slice(0, 10) })
+      .replace('<h2>表格 <span class="meta">Tables</span></h2>', `${figureHtml}<h2>表格 <span class="meta">Tables</span></h2>`)
+    await writeFile(path.join(outDir, 'report.html'), html)
+    const pdf = renderPdf({ html, outPath: path.join(outDir, 'report.pdf') })
+    await writeFile(path.join(outDir, 'results.json'), JSON.stringify({ ...built, figures: built.figures.map(figure => ({ ...figure, svg: undefined, png: figures.find(item => item.key === figure.key)?.png || null })) }, null, 2))
+    // 三线表的 DOCX / XLSX：本地 python-docx / openpyxl 渲染，失败也要写进结果而不是静默跳过。
+    let office = { ok: false, reason: '未运行' }
+    if (cfg.pythonPath) {
+      const output = await python(cfg, path.join(HERE, 'office_export.py'), ['--results', path.join(outDir, 'results.json'), '--out', outDir], { timeoutMs: 120000 })
+      office = output && output.ok === true ? { ok: true, docx: output.docx, xlsx: output.xlsx, tables: output.tables } : { ok: false, reason: String(output?.error || '三线表导出失败') }
+    }
+    const artifacts = []
+    const addFile = async (relative, mediaType) => {
+      const content = await readFile(path.join(outDir, relative))
+      artifacts.push({ mediaType, relativePath: relative, sha256: hash(content) })
+    }
+    await addFile('report.html', 'text/html')
+    for (const figure of built.figures) await addFile(figure.svg, 'image/svg+xml')
+    for (const figure of figures) await addFile(figure.png, 'image/png')
+    await addFile('results.json', 'application/json')
+    if (office.ok) {
+      await addFile('tables.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+      await addFile('tables.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    }
+    if (pdf.ok) await addFile('report.pdf', 'application/pdf')
+    const manifest = artifactManifest({ results: built, artifacts })
+    manifest.presentationRevision = revision
+    manifest.parent = previous ? `presentation/${previous}/manifest.json` : null
+    manifest.pdf = pdf.ok ? { relativePath: 'report.pdf' } : { unavailable: pdf.reason }
+    manifest.office = office.ok ? { docx: 'tables.docx', xlsx: 'tables.xlsx' } : { unavailable: office.reason }
+    await writeFile(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
+    return { runId, revision, dir: `runs/${runId}/presentation/${revision}`, artifacts: artifacts.map(item => item.relativePath), figures: built.figures.map(figure => figure.key), png: figures.length, pdf: pdf.ok, office: office.ok, manifest, study: context.identity }
+  }
+  const escapeAttr = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]))
 
-      scope.tools.register({
-        name: 'analysis_results',
-        description: '读某次分析的三线表与结论。不传 runId 时读最近一次。返回描述统计、质控、主分析（若门禁已开）等表格的文本。',
-        parameters: {
-          type: 'object',
-          properties: {
-            runId: { type: 'string', description: '运行编号（形如 20261029-012138）；不填则用最近一次' },
-            table: { type: 'string', description: '只看某张表，如 table1_descriptives；不填则给全部' }
-          },
-          additionalProperties: false
-        },
-        output: textOutput,
-        async execute(args) {
-          const payload = await resultsPayload(String((args && args.runId) || '').trim())
-          if (!payload.runId) return { text: '还没有任何分析结果：先调用 analysis_run。' }
-          const only = String((args && args.table) || '').trim()
-          const lines = [`运行 ${payload.runId}：n = ${payload.meta && payload.meta.n}，数据截止 ${payload.meta && payload.meta.dataCutoff}`]
-          const gate = payload.meta && payload.meta.model && payload.meta.model.gate
-          if (gate) lines.push(gateLine(gate))
-          for (const table of payload.tables) {
-            if (only && table.key !== only) continue
-            lines.push('', `## ${table.label}`)
-            lines.push('| ' + table.columns.join(' | ') + ' |')
-            lines.push('|' + table.columns.map(() => '---').join('|') + '|')
-            for (const row of table.rows.slice(0, 40)) lines.push('| ' + row.join(' | ') + ' |')
-            if (table.rows.length > 40) lines.push(`（还有 ${table.rows.length - 40} 行，见 ${path.join(cfg.labDir, 'runs', payload.runId, 'tables', table.key + '.csv')}）`)
-          }
-          if (!only && payload.report) {
-            const summary = payload.report.split('\n').filter(line => line.startsWith('- ') || line.startsWith('## ')).slice(0, 12)
-            lines.push('', '## 报告要点', ...summary)
-          }
-          if (payload.meta && payload.meta.changedSinceLast && payload.meta.changedSinceLast.newSubjects) {
-            lines.push('', `比上次新增：${payload.meta.changedSinceLast.newSubjects.join('、') || '无'}`)
-          }
-          return { text: lines.join('\n') }
-        }
+  /* ---------- 去抖自动运行（config.autoRun，默认关闭） ---------- */
+  let autoTimer = null
+  let autoDebounce = null
+  let autoBusy = false
+  let autoError = ''
+  let autoTicks = 0
+  let autoPausedHash = null
+  function readInstanceId(dataRoot) {
+    try { return JSON.parse(readFileSync(path.join(dataRoot, 'study-instance.json'), 'utf8')).instanceId || null } catch { return null }
+  }
+  function scheduleDebounced(instanceId, hash = null) {
+    if (autoDebounce) clearTimeout(autoDebounce)
+    autoDebounce = setTimeout(() => {
+      autoDebounce = null
+      run({}, current(), { instanceId }).then(() => { autoError = ''; autoPausedHash = null }).catch(error => {
+        autoError = String(error && error.message ? error.message : error)
+        // 同一份数据自动跑失败后不要每轮重试，等数据再变才继续。
+        autoPausedHash = hash
       })
-
-      scope.tools.register({
-        name: 'analysis_exclude',
-        description: '维护排除名单 _lab/exclusions.csv。排除规则必须人定：add 必须给理由；remove 把该编号移出名单。改完名单后要重跑合并（analysis_run stage=merge 或 all）才会进入结果。',
-        parameters: {
-          type: 'object',
-          properties: {
-            op: { type: 'string', enum: ['add', 'remove'], description: 'add=加入排除；remove=恢复' },
-            id: { type: 'string', description: '被试编号（5 位数字）' },
-            reason: { type: 'string', description: '排除理由（add 必填），写进 _lab/exclusions.csv' }
-          },
-          required: ['op', 'id'],
-          additionalProperties: false
-        },
-        output: textOutput,
-        async execute(args) {
-          const op = String((args && args.op) || 'add')
-          const id = String((args && args.id) || '').trim()
-          if (!isId(id)) throw new Error('被试编号应为 5 位数字')
-          if (op === 'remove') {
-            const items = (await readExclusions()).filter(item => String(item['编号'] || '').trim() !== id)
-            await writeExclusions(items)
-            return { text: `已把 ${id} 移出排除名单；当前排除 ${items.length} 人。重跑合并后生效。` }
-          }
-          const reason = String((args && args.reason) || '').trim()
-          if (!reason) throw new Error('排除必须写理由：排除规则由人定，脚本只执行')
-          const items = (await readExclusions()).filter(item => String(item['编号'] || '').trim() !== id)
-          items.push({ 编号: id, 原因: reason, 时间: new Date().toISOString().slice(0, 10), 操作: '工具' })
-          await writeExclusions(items)
-          return { text: `已排除 ${id}（${reason}）；当前排除 ${items.length} 人。重跑合并后生效。` }
-        }
-      })
-    } catch (error) {
-      console.error('[analysis-run] 工具注册失败：', error)
+    }, Number(config.debounceMs) || 3000)
+    if (autoDebounce.unref) autoDebounce.unref()
+  }
+  async function autoTick() {
+    if (autoBusy) return
+    autoBusy = true
+    autoTicks += 1
+    try {
+      const { cfg, context } = current()
+      if (!context || !context.configured) return
+      if (LOCKS.has(cfg.outputDir) || WRITES.has(cfg.outputDir)) return
+      const plan = await planFor(cfg)
+      if (!plan || !plan.source || plan.source.type !== 'core') return
+      const instanceId = readInstanceId(context.dataRoot)
+      if (!instanceId) return
+      let built
+      try {
+        built = openAnalysis({ data: openResearchData({ study: context, instanceId }), study: context, owner: 'analysis-run' }).dataset({ plan })
+      } catch { return }
+      const history = await runs(cfg)
+      // 已有排队的去抖就不重置：否则每轮轮询都会把等待时间往后推，永远等不到执行。
+      if (!history.length) { if (!autoDebounce && autoPausedHash !== built.hash) scheduleDebounced(instanceId, built.hash); return }
+      const latest = await readJson(path.join(cfg.outputDir, 'runs', history[0].runId, 'meta.json'), null)
+      const latestHash = latest?.dataset?.hash || latest?.source?.sha256
+      if (latestHash === built.hash) return
+      if (!autoDebounce && autoPausedHash !== built.hash) scheduleDebounced(instanceId, built.hash)
+    } finally {
+      autoBusy = false
     }
   }
-
-  const tools = ctx.get ? ctx.get('tools') : undefined
-  if (tools) registerTools({ tools })
-  else ctx.inject(['tools'], registerTools)
+  function startAuto() {
+    if (!config.autoRun || autoTimer) return
+    autoTimer = setInterval(() => { autoTick().catch(() => {}) }, Number(config.autoPollMs) || 2000)
+    if (autoTimer.unref) autoTimer.unref()
+    setTimeout(() => { autoTick().catch(() => {}) }, 50).unref?.()
+  }
+  const attach = scope => scope.effect(() => scope.webServer.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route')
+  const web = ctx.get?.('webServer'); if (web) ctx.effect(() => web.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route'); else ctx.inject(['webServer'],attach)
+  const register = scope => {
+    const output = { schema:{type:'object',properties:{text:{type:'string'}},required:['text'],additionalProperties:false},render:(_a,v)=>[{type:'text',text:v.text}] }
+    const defs = [
+      ['analysis_status','查看当前研究、分析方案、输入状态与运行历史。',{},[],async (args,exec)=>{
+        const { data } = await binding.read(binding.agentActor(exec), async view => status({}, view))
+        return JSON.stringify({ ...data, binding: undefined }, null, 2)
+      }],
+      ['analysis_run','运行通用分析或显式配置的本地适配器，每次通用运行保存独立快照。',{stage:{type:'string'},runId:{type:'string'}},[],async (args,exec)=>{
+        const actor = binding.agentActor(exec)
+        const { binding: view, data } = await binding.write(actor, {}, async (_v, state) => requestRun(args || {}, state, _v), { holdLock: false, capture: () => current() })
+        return JSON.stringify({ ...data, binding: view }, null, 2)
+      }],
+      ['analysis_results','读取指定运行的动态表格、节点状态与报告。',{runId:{type:'string'},table:{type:'string'}},[],async (args,exec)=>{
+        const actor = binding.agentActor(exec)
+        const { data } = await binding.read(actor, async () => { const value = await results(args || {}); if (args && args.table) value.tables = value.tables.filter(row => row.key === args.table); return value })
+        return JSON.stringify(data, null, 2)
+      }],
+      ['analysis_export','把指定运行导出为自包含 HTML/PDF/三线表图片与产物清单（本地渲染，不调云端）。',{runId:{type:'string'}},[],async (args,exec)=>{
+        const actor = binding.agentActor(exec)
+        const { data } = await binding.write(actor, {}, async (_v) => exportRun(args || {}), { holdLock: false, capture: () => current() })
+        return JSON.stringify({ ...data, binding: undefined }, null, 2)
+      }],
+      ['analysis_exclude','按研究编号维护人工排除；新运行应用变更，历史快照不变。',{id:{type:'string'},op:{type:'string',enum:['add','remove']},reason:{type:'string'}},['id','op'],async (args,exec)=>{
+        const actor = binding.agentActor(exec)
+        const { data: view } = await binding.read(actor, () => schema())
+        const { data } = await binding.write(actor, {}, async () => await serialWrite(current().cfg.outputDir, () => exclude({ ...(args || {}), revision: view.exclusionsRevision })))
+        return JSON.stringify(data, null, 2)
+      }]
+    ]
+    for (const [name,description,properties,required,execute] of defs) scope.tools.register({name,description,parameters:{type:'object',properties,required,additionalProperties:false},output,execute:async (args, exec)=>({text:await execute(args||{}, exec)})})
+  }
+  const tools = ctx.get?.('tools'); if (tools) register({tools}); else ctx.inject(['tools'],register)
+  startAuto()
 }
-
 export const name = 'analysis-run'
+export const version = '0.2.0'

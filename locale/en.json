@@ -1,6 +1,3 @@
 {
-  "meta": {
-    "title": "Analysis Pipeline",
-    "description": "From DDT raw files to publication tables: ingest, AUC/k, merge, descriptives and ANCOVA, with a data fingerprint per run."
-  }
+  "meta": { "title": "Analysis Run", "description": "Study-driven CSV analysis with input and environment snapshots and explicit analysis node states." }
 }

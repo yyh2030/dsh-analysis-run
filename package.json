@@ -1,9 +1,9 @@
-﻿{
+{
   "name": "@local/analysis-run",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "分析直通：DDT 原始 CSV → 逐试次长表 → 无差异点/AUC/k → 三线表与报告，每次运行记下数据指纹与门禁结论",
+  "description": "Local CSV analysis with explicit study plans, gated analysis modules and immutable run snapshots",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -12,18 +12,23 @@
   },
   "files": [
     "index.js",
-    "pipeline.py",
-    "ddt.py",
-    "sap.py",
-    "phase.py",
+    "engine.py",
+    "office_export.py",
+    "vendor/wheels",
+    "vendor/install.mjs",
+    "vendor/manifest.json",
+    "vendor/README.md",
+    "study-context.mjs",
+    "study-selection.mjs",
     "client.js",
     "locale/*.json",
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "tests"
+    "tools"
   ],
   "dsh": {
+    "minVersion": "0.2.2-rc.1",
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

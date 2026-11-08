@@ -1,139 +1,107 @@
-# 分析直通（analysis-run）
+# Analysis Run
 
-DDT 原始 CSV → 逐试次长表 → 无差异点 / AUC / k → 三线表、图与报告。每次运行写下数据指纹、
-排除名单与门禁结论，让「这是截止哪天、n = 多少」永远说得清。
+Local CSV analysis for independent and repeated observations. A study definition supplies identity, paths and column mappings. Participants are nonempty strings; groups are separate columns. There are no personal data paths or task-specific defaults.
 
-## 数据契约
+## Configuration
 
-```
-<labDir>/                      默认 D:/yyh-lab
-  cache/                       派生缓存，删掉可重建
-    manifest.json              每个原始文件的 mtime / size / session
-    files/<sha12>-<原名>.csv    单文件解析结果
-    trials.csv                 逐试次长表（全部被试全部时间点）
-    indifference_points.csv    每格无差异点
-    auc_k.csv                  每被试每时间点 AUC / k / ln(k)
-    auc_wide.csv               每被试一行（T0/T1/T2 宽表 + 分组）
-  runs/<runId>/                每次运行，runId = YYYYMMDD-HHMMSS
-    dataset.csv                合并后的分析数据集（含 included / excluded 列）
-    tables/table1..20*.csv     三线表（utf-8-sig，Excel 直接开）
-    fig_auc_trajectory.png     各格 AUC 轨迹（M ± SE）
-    fig_auc_by_cell.png        T2 各格分布
-    fig_ftps_trajectory.png    FTPS 三波轨迹
-    fig_delta_ftps_auc.png     ΔFTPS 与 T2 AUC 的散点
-    fig_mediation.png          中介路径示意（a / b / 间接效应）
-    model.json                 描述统计、主分析、敏感性、SAP 结果
-    meta.json                  输入指纹、n、included/excluded、门禁、与上次的差异
-    report.md                  报告（表、图、口径、每张表的解读）
-  exclusions.csv               排除名单：编号,原因,时间,操作
-```
+Use `studyPath` to select a JSON study. Relative paths in `plugins.analysis` resolve from that document. With no study file, the plugin uses an empty path-based study rooted in the configured project directory. Queries do not create directories. Set `pythonPath` to an interpreter with numpy, pandas, scipy and statsmodels, or provide `python` on PATH.
 
-原始数据（`正式实验数据/DDT/*.csv`）与量表作答一律只读。`cache/` 与 `runs/` 都是缓存，
-删掉会重算；`meta.json` 是唯一承诺保存的「哪版数据对哪版结果」记录。
-
-## 五个阶段
-
-| 阶段 | 做什么 | 缓存键 / 依赖 |
-|---|---|---|
-| 1 ingest | 解析 `正式实验数据/DDT/*.csv`，拼成逐试次长表 | 每个文件的 mtime + size（变了才重解析） |
-| 2 derive | 每格第 6 次呈现 → 无差异点 → 归一化 AUC 与 k | 逐试次长表 |
-| 3 merge | AUC 宽表 + `_lab/scores.csv` + `demographics.json` + 排除名单 | 各输入文件 |
-| 4 model | 描述统计、质控、T2−T0 变化；门禁到了再跑 ANCOVA；再跑 SAP（15.1/15.3/15.4/15.5） | 数据集 + 脚本哈希 |
-| 5 report | 三线表、五张图、`report.md`（含每张表的「为什么」与「意味着什么」） | 模型输出 |
-
-新被试进来时只有摄取阶段真的干活；其余阶段重算，n 不到 200 时整条管子在一两秒内跑完。
-
-## 暂行分析方案（SAP）落地
-
-`model` 阶段在描述统计之后自动跑 `sap.py`，覆盖方案里数据能支持的条目：
-
-| 表 | 内容 | 方案条目 |
-|---|---|---|
-| 9–16 | 缺失与完成、完成率、分布、FTPS 信度（含反向计分）、基线平衡、非系统折扣（分级）、预实验 DTA、STAI-S 变化 | 15.1 |
-| 17 | FTPS 在 T0/T1/T2 的线性混合模型（随机截距，时间 × 干预 / 时间 × 突显，LRT） | 15.3 |
-| 18 | 探索性 bootstrap 中介（a、b、a×b、总效应），5000 次重抽样 | 15.3 |
-| 19 | STAI-T 调节：**未执行**（数据里没有 STAI-T）+ STAI-S 的替代探索模型 | 15.4 |
-| 20 | ITT 与 per-protocol（排除「明确」非系统折扣）的主效应比较 | 15.5 |
-| 21–35 | 阶段描述、全体变化、带方向的主模型对比、诱发/干预阶段模型、三时点混合、想象过程评价与关联、敏感性（HC3 / 基线焦虑 / 两套排除）、逐人剔除、五个延迟点、金额档、对数延迟 AUC、情绪次要结果 | 讨论后新增（`phase.py`） |
-
-`phase.py` 的对比都从同一个主模型里取（共用基线斜率与残差方差），统一 EFT−ERT、
-交互 = (EFT−ERT)MS − (EFT−ERT)DP；AUC 上为正才符合「MS 后 EFT 优势更大」。控制 T1 的
-模型只回答「干预阶段新增了什么」，不替代原方案控制 T0 的主检验。
-
-几条固定口径：
-
-- 非系统折扣按 Johnson & Bickel (2008) 的 20% 规则分级：≥2 次违规或两端极端反应记「明确」，
-  1 次记「轻微」；per-protocol 只排除「明确」的（否则 18 人里要筛掉 11 人）。
-- FTPS 信度必须按定义反向（第 8/9/10 题）；不反向直接算 α 会得到接近 0 的假象。
-- 中介只作探索：EFT/ERT 是被试间操纵，FTPS 不是独立操纵变量。
-
-## 口径（改之前先想清楚）
-
-- 无差异点：每格第 6 次呈现的即时金额（IP）。
-- AUC：Myer et al. (2016) 归一化，`r = IP / 该档延迟金额`，`x = 延迟 / 1825 天`，
-  锚点 `(0, 1)`，梯形积分，取值 0–1；两档平均。
-- k：`V = A / (1 + kD)`，按档最小二乘拟合，`log10(k) ∈ [−7, 2]`；`ln(k)` 取两档平均。
-- 分组：编号第 1 位 1=MS / 2=DP，第 2 位 1=EFT / 2=ERT。
-- 排除：只执行 `_lab/exclusions.csv` 的名单，脚本从不自动排除。
-- 版本：`ddt.py` + `pipeline.py` 的 sha256 写进 `meta.json`；改口径必须同时改 `VERSION`。
-
-以上与 `03_延迟折扣任务与代码/Codes/` 里的 `ddt_extract_rt.py`、`ddt_preprocess.py`、
-`ddt_primary_analysis.py` 一致：在 12 名历史被试上，IP 与 AUC/ln(k) 与旧输出逐位相同
-（`tests/test_ddt.py` 里有这条对拍）。
-
-## 门禁
-
-- `n < 30`：只出预处理、描述统计与质控，不出推断结论。
-- `30 ≤ n < 40`：描述统计 + T2−T0 的配对变化（描述性 95% CI），仍不出主分析。
-- `n ≥ 40`：主分析 `AUC_T2 ~ 突显 × 干预 + AUC_T0`（Type III，Sum 编码），
-  同时给简单效应、调整均值与 `ln(k)` 敏感性分析。
-
-门禁阈值在插件配置 `gateExplore` / `gateMain`，环境变量 `DDT_GATE_EXPLORE` / `DDT_GATE_MAIN`
-只用于测试，别在正式运行里设。
-
-## 工具与面板
-
-- `analysis_status()`：上次运行、n、截止日、门禁、新到文件、缓存与排除名单。
-- `analysis_run(stage)`：`all` 或单阶段；单阶段并进最近一次运行（面板给的那次）。
-- `analysis_results(runId?, table?)`：读某次运行的三线表与要点。
-- `analysis_exclude(op, id, reason?)`：维护排除名单（`add` 必须给理由）。
-- 面板「分析直通」：状态头、单跑阶段、三线表、报告、图、运行历史、排除名单。
-
-## 安装与配置
-
-```
-目标目录：D:/dsh-plugins/analysis-run
-安装：plugin_manager install_bundle  D:/dsh-plugins/analysis-run
+```json
+{
+  "schemaVersion": 1,
+  "studyId": "sample-study",
+  "name": "Sample study",
+  "dataRoot": "./data",
+  "plugins": {
+    "analysis": {
+      "dataPath": "./measurements.csv",
+      "idColumn": "participantId",
+      "outcome": "score",
+      "layout": "wide",
+      "groupColumns": ["condition"],
+      "covariates": ["baseline"],
+      "analyses": ["descriptives", "regression"],
+      "gate": { "minSubjects": 30 }
+    }
+  }
+}
 ```
 
-`cordis.patch.yml` 的配置项：
+The panel edits a study-local analysis plan. Saving requires the current study and plan revision. Exclusions require a reason and arbitrary study-valid participant ID. Every new run takes a snapshot; historical runs retain their original input and analysis set.
 
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `projectRoot` | `C:/Users/16787/OneDrive/Desktop/yyh硕士论文` | 原始数据在它下面 |
-| `labDir` | `D:/yyh-lab` | 缓存、运行记录、排除名单 |
-| `rawDir` | `<projectRoot>/正式实验数据/DDT` | 原始 CSV 目录 |
-| `pythonPath` | 项目里的 `.analysis_venv` | 需要 pandas / numpy / scipy / statsmodels（画图另需 matplotlib） |
-| `gateExplore` / `gateMain` | 12 / 12（当前配置；设计稿预设 30 / 40） | 门禁。低于 40 时主分析照跑，但报告会标「只作探索性参考」 |
+## Analysis wizard (panel)
 
-> 当前为了先看主分析，配置里把门禁降到了 12；报告与 `meta.json` 都会注明「样本低于预设门禁 40，
-> 只作探索」。等 n 到 40 时把 `gateExplore`/`gateMain` 改回 30/40，这个提示会自动消失。
+The 分析方案 tab is a guided flow:
 
-## 测试
+1. Pick one of nine task cards (descriptive, correlation, reliability, t test, ANOVA,
+   regression/ANCOVA, mediation, paired, mixed model). The card sets `analyses`.
+2. Pick variables from dropdowns/chips built from the dataset columns (`preview` action
+   returns the column list without writing anything).
+3. The preview box shows the implied formula, dataset rows/columns, eligible participants
+   per module, and the expected tables/figures.
+4. "保存并运行" saves the plan and starts a run; "高级编辑" opens the raw field form
+   (still available for unusual plans).
 
+The `preview` action accepts a draft plan (`{plan}`) and returns
+`{columns, rows, modules: {<module>: {eligible, backends}}}`. It never writes run files.
+
+## Custom scripts (`script` module)
+
+For analyses the built-in modules do not cover, select the 自定义脚本 card in the wizard
+(or set `plan.script`) and write Python against the prepared dataset:
+
+```python
+means = data.groupby('group', as_index=False)['outcome'].mean()
+save('group_means', means)
 ```
-<pythonPath> -m unittest discover -s tests -v
-```
 
-`tests/test_ddt.py` 覆盖：IP 取第 6 次呈现、AUC 与手算梯形积分一致、k 拟合还原已知 k、
-宽表分组、与历史分析的逐位对拍（历史输出不存在时跳过）。
+- `data` is the prepared wide/long DataFrame (same rows the built-in modules use).
+- `save(name, frame)` writes a CSV table; every saved table is added to the run's
+  tables, the HTML/PDF report, and the Word/Excel export.
+- `pd` (pandas) and `scipy`/`statsmodels` (when the vendored backend is present) are
+  available; `out_dir` lets you write arbitrary files next to the tables.
+- The script runs in a subprocess with the data CSV, a 180 s timeout, and the plugin's
+  Python environment. Nonzero exit, timeout, or "no tables saved" fail the node with a
+  readable reason; the previous tables are not mixed in.
+- `plan.script.file` runs a `.py` file instead of inline `code`.
 
-## 排错
+Scripts are the user's own code, executed with the user's permissions: keep them in the
+project, review changes before running, and never point them at untrusted files.
 
-- **Python 不可用**：面板顶部会写具体错误。确认 `pythonPath` 指向的解释器能
-  `import pandas, statsmodels`；项目里那个 venv 是现成的。
-- **同一 session 有两个文件**：摄取阶段保留 `expStart` 最晚的一份，其余记进
-  `meta.json` 的 `dropped`，并在质控表的「重复试次」里露出。
-- **单跑模型/报告说「先跑合并」**：那一次运行还没有 `dataset.csv`。点「跑全部」，
-  或先跑合并阶段。
-- **结果和上次不一样**：看 `meta.json` 的 `changedSinceLast`（新增/退出的被试、交互项 p 的变化）。
+## Asking the Agent instead (natural language)
+
+Because the panel is a Harness plugin, you can skip the form entirely and ask in the
+conversation, for example:
+
+> 用当前分析数据跑 AUC_T2 在 salience × intervention 上的 ANCOVA，控制 AUC_T0，然后导出报告。
+
+The Agent maps that to the plan, calls the same `run`/`export` actions and reports back.
+Useful for one-off models, re-running after data updates, or producing a written summary.
+The panel then just shows the resulting run and its artifacts.
+
+## Supported modules
+
+- `descriptives`: group-wise valid/missing observations, independent participants and summary statistics.
+- `regression`: independent wide rows, categorical group main effects and numeric covariates using OLS; ANCOVA is the same model with groups and baseline covariates. Rank-deficient designs fail explicitly.
+- `paired`: pooled, unadjusted paired changes; configured groups/covariates do not enter this test. Wide `pairedColumns: ["before", "after"]`, or long `within: {"column":"visit", "levels":["before","after"]}`. Uses complete pairs and a paired t test.
+- `mixed`: long rows, declared within column/levels, categorical between groups and numeric covariates, ML random participant intercept. Nonconvergence fails explicitly. This module does not claim to implement arbitrary longitudinal designs or automatic interactions.
+
+Every inferential module applies the configured minimum to its own complete eligible independent participants. Each node is `executed`, `not_run` with reason, or `failed`. P values remain full precision in model/CSV; reports format only for display. Missing numeric values are blank CSV cells; nonnumeric/infinite input fails validation.
+
+## Run records
+
+`<dataRoot>/analysis/runs/<runId>/` contains input, study, plan and exclusion snapshots, package/environment versions, full engine/Host/client/shared helper code copies and hashes, node models, successful tables and report. The run ID is unique; completed runs are not overwritten. `revisionOf` links a new analysis to a selected earlier run. Source and artifact hashes detect changes. A corrupt artifact hides results rather than presenting a mixed version. Failed runs retain a status and error for recovery by a new run.
+
+## Local adapters
+
+An explicit `adapterPath` can point to a local JSON manifest with `schemaVersion:1`, `pipelinePath`, dynamic `stages`, optional `tableLabels`, `gateEnvironment`, `exclusionsFile` and `exclusionColumns`. A bare `pipelinePath` is also supported with explicit `projectRoot`, `rawDir` and `labDir`. The Host passes those paths to the adapter's `--stage ... --json` CLI. No adapter is automatically discovered. Adapter-owned history and stage rules remain the adapter's responsibility; the panel uses dynamic labels and tables. Private manifests and code do not belong in this package.
+
+## API
+
+Same-origin `/api/analysis-run` requires `x-analysis-run:1`. GET: `schema`, `status`, `results`, `preview`. POST: `plan`, `run`, `exclude`, `studyConnect`, `studySave`. Mutations carry `studyId`, `studyRevision`, `selectionRevision`; plan/exclusion saves also carry the corresponding revision from status. `studySave` creates a new definition without overwriting an existing file, then connects all registered research plugins. Tools inject current context automatically and serialize writes through the same actions.
+
+Research switching shares a process registry across the four research plugins. A running or saving plugin rejects the switch; prepare is read-only, commit replaces validated in-memory context, and rollback restores it on failure. Initial project-specific overrides are discarded when selecting another study.
+
+## Verification
+
+Run `acceptance/test_engine.py` with an explicit scientific Python interpreter and `PYTHONDONTWRITEBYTECODE=1`. Run `acceptance/generic-host.test.mjs` and `acceptance/timeout.test.mjs` with Node and `ANALYSIS_TEST_PYTHON` pointing to that interpreter. Fixtures are synthetic and output only to temporary directories. No installed plugin, personal project or external HTTP service is required.
