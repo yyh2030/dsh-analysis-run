@@ -19,9 +19,9 @@ vendor/
 ## 安装 / 检查
 
 ```powershell
-node D:\dsh-plugins\analysis-run\vendor\install.mjs           # 装到 vendor/site-packages
-node D:\dsh-plugins\analysis-run\vendor\install.mjs --check   # 只看当前解释器和已装版本
-node D:\dsh-plugins\analysis-run\vendor\install.mjs --python <其它解释器路径>
+node vendor/install.mjs           # 装到 vendor/site-packages
+node vendor/install.mjs --check   # 只看当前解释器和已装版本
+node vendor/install.mjs --python <其它解释器路径>
 ```
 
 脚本会先核对解释器版本与 wheel 的 ABI 标签（当前是 `cp312` / `win_amd64`），不匹配就明确报错，
