@@ -44,13 +44,22 @@ def display(key, value):
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        if abs(value) < 0.5 * 10 ** -0:
-            return '0'
-        decimals = 0 if key in INTEGER_KEYS else 2
-        if abs(value) < 0.5 * 10 ** -decimals:
-            return '0'
-        return f'{value:.{decimals}f}'
+        # 整数列只在数值确实是整数时按整数显示；Welch df 之类的浮点自由度保留小数。
+        if key in INTEGER_KEYS and float(value).is_integer():
+            return str(int(value))
+        text = f'{value:.2f}'
+        return '0.00' if text == '-0.00' else text
     return str(value)
+
+
+def numeric_format(key):
+    if key in ('p', 'p-value'):
+        return '0.0000'
+    if key == 'percent':
+        return '0.0"%"'
+    if key in INTEGER_KEYS:
+        return '0'
+    return '0.00'
 
 
 def analysis_set(table, results):
@@ -175,9 +184,15 @@ def build_xlsx(results, path):
         for offset, row in enumerate(table['rows'], start=1):
             for index, column in enumerate(columns, start=1):
                 value = row.get(column['key'])
-                cell = sheet.cell(row=header_row + 1 + offset, column=index, value=display(column['key'], value))
+                numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+                if numeric and column['key'] not in ('p', 'p-value'):
+                    # 数值单元格保留数值类型，用 number_format 控制显示；不把格式化字符串当数据。
+                    cell = sheet.cell(row=header_row + 1 + offset, column=index, value=float(value))
+                    cell.number_format = numeric_format(column['key'])
+                else:
+                    cell = sheet.cell(row=header_row + 1 + offset, column=index, value=display(column['key'], value))
                 cell.font = Font(size=9)
-                cell.alignment = Alignment(horizontal='center' if isinstance(value, (int, float)) and not isinstance(value, bool) else 'left')
+                cell.alignment = Alignment(horizontal='center' if numeric else 'left')
         last_row = header_row + 1 + len(table['rows'])
         for column_index in range(1, len(columns) + 1):
             top = sheet.cell(row=header_row, column=column_index)

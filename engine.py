@@ -14,7 +14,7 @@ import sys
 import uuid
 import re as _re
 
-VERSION = 'analysis-engine/2.2.0'
+VERSION = 'analysis-engine/2.3.0'
 MODULES = ('descriptives', 'sample', 'sensitivity', 'correlation', 'reliability', 'ttest', 'anova', 'mediation', 'regression', 'paired', 'mixed', 'script')
 # 每个模块需要的本地依赖；缺后端时显示"环境待准备"，不能悄悄换成别的检验。
 BACKENDS = {'descriptives': ('numpy', 'pandas'), 'sample': ('numpy', 'pandas'), 'sensitivity': ('numpy', 'pandas'), 'correlation': ('numpy', 'pandas'), 'reliability': ('numpy', 'pandas'), 'ttest': ('numpy', 'pandas'), 'anova': ('numpy', 'pandas', 'statsmodels'), 'mediation': ('numpy', 'pandas', 'statsmodels'), 'script': ('numpy', 'pandas'), 'regression': ('numpy', 'pandas', 'statsmodels'),
@@ -1344,12 +1344,13 @@ def run(request):
         meta.update(subjects=int(data[plan['idColumn']].nunique()),observations=len(data),excludedIds=sorted(excluded))
         (run_dir/'tables').mkdir()
         tables=[]
-        def put(key,label,rows):
+        def put(key,label,rows,analysis_set=None):
             rows=clean(rows)
             if not rows: return
             frame=pd.DataFrame(rows)
             relative=f'tables/{key}.csv'; frame.to_csv(run_dir/relative,index=False,encoding='utf-8-sig')
-            tables.append({'key':key,'label':label,'columns':list(frame.columns),'rows':frame.astype(object).where(frame.notna(),None).values.tolist(),'path':relative})
+            types={column: ('number' if any(isinstance(row.get(column),(int,float)) and not isinstance(row.get(column),bool) for row in rows) else 'string') for column in frame.columns}
+            tables.append({'key':key,'label':label,'columns':list(frame.columns),'rows':frame.astype(object).where(frame.notna(),None).values.tolist(),'path':relative,'types':types,'analysisSet':analysis_set})
         minimum=plan.get('gate',{}).get('minSubjects',30)
         functions={'descriptives':describe,'sample':sample_table,'sensitivity':sensitivity_table,'correlation':correlation,'reliability':reliability,'ttest':ttest,'anova':anova,'mediation':mediation,'script':run_script,'regression':regression,'paired':paired,'mixed':mixed}
         chosen=plan.get('analyses') or ['descriptives']
@@ -1367,27 +1368,28 @@ def run(request):
                 if module not in ('descriptives', 'sample', 'sensitivity', 'script') and eligible<minimum:
                     meta['nodes'][module]={'status':'not_run','dependsOn':['prepare'],'reason':f'{eligible} eligible participants < gate {minimum}','eligibleSubjects':eligible}
                     continue
+                aset = {'id': canonical({'module': module, 'ids': ids, 'columns': schema['required']})[:16], 'subset': plan.get('subset') or 'enrolled', 'subjects': eligible, 'n': eligible, 'observations': int(len(frame)), 'columns': schema['required'], 'ruleVersion': VERSION}
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter('always')
                     value=clean(functions[module](frame,plan))
                 meta['warnings'] += [f'{module}: {warning.message}' for warning in caught]
                 if module=='descriptives':
-                    put('descriptives','Descriptive statistics',value)
+                    put('descriptives','Descriptive statistics',value,aset)
                     if plan.get('frequencies'):
-                        put('frequencies','Frequency tables',frequencies(frame,plan))
+                        put('frequencies','Frequency tables',frequencies(frame,plan),aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'subjects':meta['subjects'],'observations':meta['observations']}}
                 elif module=='sample':
-                    put('sample','Sample characteristics',value)
+                    put('sample','Sample characteristics',value,aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'subjects':meta['subjects'],'rows':len(value)}}
                 elif module=='sensitivity':
-                    put('sensitivity','Sensitivity: complete cases',value)
+                    put('sensitivity','Sensitivity: complete cases',value,aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'rows':len(value)}}
                 elif module=='correlation' and isinstance(value,dict) and isinstance(value.get('rows'),list):
-                    put('correlation','Correlation',value['rows'])
+                    put('correlation','Correlation',value['rows'],aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'rows':len(value['rows']),'skippedScopes':value.get('skipped') or []}}
                 elif module=='script' and isinstance(value,dict) and isinstance(value.get('tables'),list):
                     for table in value['tables']:
-                        put(table['key'], table.get('label') or table['key'], table['rows'])
+                        put(table['key'], table.get('label') or table['key'], table['rows'],aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'tables':len(value['tables']),'stdout':str(value.get('stdout') or '')[:400]}}
                 elif isinstance(value,list):
                     put(module,module,value)
@@ -1395,21 +1397,59 @@ def run(request):
                 else:
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':value}
                     if module=='regression' and value.get('coefficients'):
-                        put('regression','Regression / ANCOVA',value['coefficients'])
-                        if value.get('anova'): put('anova','ANOVA / omnibus tests',value['anova'])
-                        if value.get('contrasts'): put('contrasts','Planned contrasts',value['contrasts'])
-                    elif value.get('coefficients'): put(module,module,value['coefficients'])
-                    else: put(module,module,[{k:v for k,v in value.items() if k!='subjectIds'}])
+                        put('regression','Regression / ANCOVA',value['coefficients'],aset)
+                        if value.get('anova'): put('anova','ANOVA / omnibus tests',value['anova'],aset)
+                        if value.get('contrasts'): put('contrasts','Planned contrasts',value['contrasts'],aset)
+                    elif value.get('coefficients'): put(module,module,value['coefficients'],aset)
+                    else: put(module,module,[{k:v for k,v in value.items() if k!='subjectIds'}],aset)
                 node = meta['nodes'].get(module)
                 if isinstance(node, dict) and node.get('status') == 'executed':
                     base = node.get('result') if isinstance(node.get('result'), dict) else {}
-                    node['result'] = {**base, 'analysisSet': {
-                        'id': canonical({'module': module, 'ids': ids, 'columns': schema['required']})[:16],
-                        'n': eligible, 'observations': int(len(frame)), 'columns': schema['required'],
-                        'ruleVersion': VERSION,
-                    }}
+                    node['result'] = {**base, 'analysisSet': aset}
             except Exception as error:
                 meta['nodes'][module]={'status':'failed','dependsOn':['prepare'],'reason':str(error)}
+        charts={}
+        import numpy as np
+        try:
+            if 'descriptives' in chosen:
+                frame, schema = prepare_frame(data, plan, 'descriptives')
+                ids = set(eligible_ids(frame, plan, 'descriptives'))
+                subset = frame[frame[plan['idColumn']].astype(str).isin(ids)]
+                groups = plan.get('groupColumns') or []
+                outcome = plan['outcome']
+                grouped = {}
+                for _, row in subset.iterrows():
+                    value = row[outcome]
+                    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                        continue
+                    label = ' × '.join(str(row[group]) for group in groups) if groups else '整体'
+                    grouped.setdefault(label, []).append(float(value))
+                node = meta['nodes'].get('descriptives') or {}
+                set_info = (node.get('result') or {}).get('analysisSet') or {}
+                plotted = sum(len(values) for values in grouped.values())
+                charts['distribution'] = {'outcome': outcome, 'analysisSetId': set_info.get('id'), 'n': int(plotted),
+                                          'groups': [{'label': label, 'values': values} for label, values in grouped.items()]}
+        except Exception as error:
+            charts['distribution'] = {'error': str(error)}
+        try:
+            if 'paired' in chosen:
+                frame, schema = prepare_frame(data, plan, 'paired')
+                pairs = []
+                if plan.get('layout', 'wide') == 'wide' and len(plan.get('pairedColumns') or []) == 2:
+                    before, after = plan['pairedColumns']
+                    subset = frame.dropna(subset=[before, after])
+                    pairs = [{'id': str(row[plan['idColumn']]), 'before': float(row[before]), 'after': float(row[after])} for _, row in subset.iterrows()]
+                elif plan.get('layout') == 'long' and len((plan.get('within') or {}).get('levels') or []) == 2:
+                    within = plan['within']; levels = within['levels']; outcome = plan['outcome']
+                    pivot = frame[frame[within['column']].isin(levels)].pivot_table(index=plan['idColumn'], columns=within['column'], values=outcome, aggfunc='first')
+                    subset = pivot.dropna(subset=levels)
+                    pairs = [{'id': str(index), 'before': float(row[levels[0]]), 'after': float(row[levels[1]])} for index, row in subset.iterrows()]
+                node = meta['nodes'].get('paired') or {}
+                set_info = (node.get('result') or {}).get('analysisSet') or {}
+                charts['paired'] = {'pairs': pairs, 'analysisSetId': set_info.get('id'), 'n': len(pairs)}
+        except Exception as error:
+            charts['paired'] = {'error': str(error)}
+        meta['charts'] = charts
         meta['status']='partial' if any(v['status']=='failed' for v in meta['nodes'].values()) else 'ok'
         meta['tables']=[{k:v for k,v in table.items() if k not in ('columns','rows')} for table in tables]
         meta['finishedAt']=now()

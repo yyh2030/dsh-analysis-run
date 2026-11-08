@@ -504,85 +504,60 @@ export function apply(ctx, config = {}) {
     const built = buildResults({ run: { runId }, meta: data.meta, tables: data.tables.map(table => tableFromGrid(table)) })
     const figures = []
     const figureFiles = []
-    const addFigure = async (key, chart) => {
+    const addFigure = async (key, chart, analysisSetId = null) => {
       if (!chart || chart.ok === false) return
-      figureFiles.push({ key, width: chart.width, height: chart.height })
-      built.figures.push({ key, title: chart.title || key, svg: `figures/${key}.svg`, width: chart.width, height: chart.height })
+      figureFiles.push({ key, width: chart.width, height: chart.height, analysisSetId })
+      built.figures.push({ key, title: chart.title || key, svg: `figures/${key}.svg`, width: chart.width, height: chart.height, analysisSetId })
       await writeFile(path.join(outDir, 'figures', `${key}.svg`), chart.svg)
       const png = renderPng({ svg: chart.svg, outPath: path.join(outDir, 'figures', `${key}.png`), width: chart.width, height: chart.height, dpi: 300 })
       if (png.ok) figures.push({ key, png: `figures/${key}.png`, dpi: png.dpi })
     }
     await mkdir(path.join(outDir, 'figures'), { recursive: true })
+    const STAT_COLUMNS = new Set(['subjects', 'n', 'mean', 'sd', 'se', 'median', 'q1', 'q3', 'iqr', 'minimum', 'maximum', 'valueRange', 'ciLow', 'ciHigh', 'missing'])
     const descriptives = built.tables.find(table => table.key === 'descriptives')
-    const dataTable = built.tables.find(table => table.key === 'data' || table.key === 'merged' || table.key === 'model')
+    const descriptiveSet = descriptives?.analysisSet || built.analysisSet
     if (descriptives && descriptives.columns.some(column => column.key === 'mean')) {
-      const labelColumn = descriptives.columns.find(column => !['subjects', 'n', 'mean', 'sd', 'se', 'median', 'q1', 'q3', 'iqr', 'minimum', 'maximum', 'valueRange', 'ciLow', 'ciHigh', 'missing'].includes(column.key))?.key
+      // 多因素时用完整的组标签，不只取第一个分组列；计数列不参与标签。
+      const labelKeys = descriptives.columns.map(column => column.key).filter(key => !STAT_COLUMNS.has(key))
       const chart = pointRangeChart({
-        title: '分组估计与 95% 区间', subtitle: `分析集 ${built.analysisSet.subset} · 独立人数 ${built.analysisSet.subjects ?? '—'}`, height: 420,
-        rows: descriptives.rows.map(row => ({ label: labelColumn ? String(row[labelColumn]) : '整体', estimate: row.mean, low: row.ciLow, high: row.ciHigh, n: row.subjects ?? row.n })),
+        title: '分组估计与 95% 区间',
+        subtitle: `分析集 ${descriptiveSet.subset} · 独立人数 ${descriptiveSet.subjects ?? '—'} · 观测 ${descriptiveSet.observations ?? '—'}`,
+        height: 420,
+        rows: descriptives.rows.map(row => ({
+          label: labelKeys.map(key => String(row[key] ?? '')).filter(Boolean).join(' × ') || '整体',
+          estimate: row.mean, low: row.ciLow, high: row.ciHigh, n: row.subjects ?? row.n,
+        })),
       })
-      await addFigure('group-estimates', chart)
-      // 分布图：直接用本次运行快照的 input.csv（原始观测，不分箱重算统计量）。
-      try {
-        const grid = parseCsv(await readFile(path.join(runDir, 'input.csv'), 'utf8'))
-        const header = grid[0] || []
-        const outcome = data.meta?.plan?.outcome || ''
-        const valueIndex = header.indexOf(outcome)
-        const labelIndex = labelColumn ? header.indexOf(String(labelColumn)) : -1
-        if (valueIndex >= 0) {
-          const grouped = new Map()
-          for (const row of grid.slice(1)) {
-            const value = Number(row[valueIndex])
-            if (!Number.isFinite(value)) continue
-            const key = labelIndex >= 0 ? String(row[labelIndex] || '—') : '整体'
-            if (!grouped.has(key)) grouped.set(key, [])
-            grouped.get(key).push(value)
-          }
-          const groups = [...grouped.entries()].slice(0, 6).map(([label, values]) => ({ label, values }))
-          if (groups.length) await addFigure('distribution', distributionChart({ title: '原始观测分布', subtitle: `${outcome} · 每组一个散点条带 + 箱线`, groups, height: 460 }))
-        }
-      } catch { /* 快照缺失或读不了就不画分布图，不编造数据 */ }
+      await addFigure('group-estimates', chart, descriptiveSet.id)
+    }
+    // 分布图与配对图只使用引擎发布的分析集行（排除、缺失、变换、成对完整规则与模型一致）。
+    const distribution = data.meta?.charts?.distribution
+    if (distribution && !distribution.error && Array.isArray(distribution.groups) && distribution.groups.length) {
+      await addFigure('distribution', distributionChart({
+        title: '分析集观测分布',
+        subtitle: `${distribution.outcome} · 分析集 n=${distribution.n} · 每个点=一个观测`,
+        groups: distribution.groups.slice(0, 6), height: 460,
+      }), distribution.analysisSetId || descriptiveSet.id)
     }
     const coefficientTable = built.tables.find(table => table.key === 'coefficients') || built.tables.find(table => table.key === 'regression' && table.columns.some(column => column.key === 'term') && table.columns.some(column => column.key === 'estimate'))
     if (coefficientTable) {
-      await addFigure('model-estimates', forestChart({ title: '模型估计与 95% 区间', height: 360, rows: coefficientTable.rows.map(row => ({ label: String(row.term), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }))
+      await addFigure('model-estimates', forestChart({ title: '模型估计与 95% 区间', height: 360, rows: coefficientTable.rows.map(row => ({ label: String(row.term), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), coefficientTable.analysisSet?.id)
     }
     const contrastTable = built.tables.find(table => table.key === 'contrasts') || built.tables.find(table => table.key === 'contrast')
     if (contrastTable && contrastTable.columns.some(column => column.key === 'estimate')) {
-      await addFigure('planned-contrasts', forestChart({ title: '预设对比', height: 340, rows: contrastTable.rows.map(row => ({ label: String(row.name ?? row.term ?? '对比'), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }))
+      await addFigure('planned-contrasts', forestChart({ title: '预设对比', height: 340, rows: contrastTable.rows.map(row => ({ label: String(row.name ?? row.term ?? '对比'), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), contrastTable.analysisSet?.id)
     }
-    // 配对轨迹：从运行快照重建逐人前后值（宽表配对列，或长表的两个 within 水平）。
-    try {
+    const pairedChartData = data.meta?.charts?.paired
+    if (pairedChartData && !pairedChartData.error && Array.isArray(pairedChartData.pairs) && pairedChartData.pairs.length) {
       const plan = data.meta?.plan || {}
-      const grid = parseCsv(await readFile(path.join(runDir, 'input.csv'), 'utf8'))
-      const header = grid[0] || []
-      const idIndex = header.indexOf(plan.idColumn || '')
-      const pairs = []
-      if (idIndex >= 0 && Array.isArray(plan.pairedColumns) && plan.pairedColumns.length === 2) {
-        const beforeIndex = header.indexOf(plan.pairedColumns[0]); const afterIndex = header.indexOf(plan.pairedColumns[1])
-        if (beforeIndex >= 0 && afterIndex >= 0) {
-          for (const row of grid.slice(1)) {
-            const before = Number(row[beforeIndex]); const after = Number(row[afterIndex])
-            if (Number.isFinite(before) && Number.isFinite(after)) pairs.push({ id: row[idIndex], before, after })
-          }
-          await addFigure('paired-trajectories', pairedChart({ title: '配对变化轨迹', subtitle: `${plan.pairedColumns[0]} → ${plan.pairedColumns[1]} · 每位参与者一条线`, pairs, beforeLabel: plan.pairedColumns[0], afterLabel: plan.pairedColumns[1], height: 460 }))
-        }
-      } else if (idIndex >= 0 && plan.within?.column && Array.isArray(plan.within.levels) && plan.within.levels.length === 2) {
-        const valueIndex = header.indexOf(plan.outcome || ''); const levelIndex = header.indexOf(plan.within.column)
-        if (valueIndex >= 0 && levelIndex >= 0) {
-          const byId = new Map()
-          for (const row of grid.slice(1)) {
-            const value = Number(row[valueIndex]); const level = row[levelIndex]
-            const id = row[idIndex]
-            if (!Number.isFinite(value) || !id) continue
-            if (!byId.has(id)) byId.set(id, {})
-            byId.get(id)[level] = value
-          }
-          for (const [id, levels] of byId) if (Number.isFinite(levels[plan.within.levels[0]]) && Number.isFinite(levels[plan.within.levels[1]])) pairs.push({ id, before: levels[plan.within.levels[0]], after: levels[plan.within.levels[1]] })
-          if (pairs.length) await addFigure('paired-trajectories', pairedChart({ title: '配对变化轨迹', subtitle: `${plan.within.levels[0]} → ${plan.within.levels[1]} · 每位参与者一条线`, pairs, beforeLabel: plan.within.levels[0], afterLabel: plan.within.levels[1], height: 460 }))
-        }
-      }
-    } catch { /* 快照读不了就不画轨迹图，不编造数据 */ }
+      const beforeLabel = plan.pairedColumns?.[0] || plan.within?.levels?.[0] || '前测'
+      const afterLabel = plan.pairedColumns?.[1] || plan.within?.levels?.[1] || '后测'
+      await addFigure('paired-trajectories', pairedChart({
+        title: '配对变化轨迹',
+        subtitle: `${beforeLabel} → ${afterLabel} · 分析集 n=${pairedChartData.n} · 每位参与者一条线`,
+        pairs: pairedChartData.pairs, beforeLabel, afterLabel, height: 460,
+      }), pairedChartData.analysisSetId)
+    }
     const figureHtml = built.figures.map((figure, index) => {
       // 内联进 HTML 时去掉 SVG 命名空间（HTML5 不需要，也让报告里没有任何 http 引用）。
       const svg = readFileSync(path.join(outDir, figure.svg), 'utf8').replace(/\sxmlns="http:\/\/www\.w3\.org\/2000\/svg"/, '')
@@ -619,6 +594,12 @@ export function apply(ctx, config = {}) {
     manifest.parent = previous ? `presentation/${previous}/manifest.json` : null
     manifest.pdf = pdf.ok ? { relativePath: 'report.pdf' } : { unavailable: pdf.reason }
     manifest.office = office.ok ? { docx: 'tables.docx', xlsx: 'tables.xlsx' } : { unavailable: office.reason }
+    // 排版 revision 的可追溯信息：格式 schema、分析集引用、图表分析集与来源模型 hash。
+    manifest.formatSchema = 1
+    manifest.analysisSet = built.analysisSet
+    manifest.figures = built.figures.map(figure => ({ key: figure.key, analysisSetId: figure.analysisSetId || null }))
+    manifest.render = { html: 'ok', pdf: pdf.ok ? 'ok' : { unavailable: pdf.reason }, office: office.ok ? 'ok' : { unavailable: office.reason }, svg: built.figures.length, png: figures.length }
+    try { manifest.sourceModelHash = hash(await readFile(path.join(runDir, 'model.json'))) } catch { manifest.sourceModelHash = null }
     await writeFile(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
     return { runId, revision, dir: `runs/${runId}/presentation/${revision}`, artifacts: artifacts.map(item => item.relativePath), figures: built.figures.map(figure => figure.key), png: figures.length, pdf: pdf.ok, office: office.ok, manifest, study: context.identity }
   }
