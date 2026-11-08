@@ -2,7 +2,7 @@
 
 [中文](README.md) · English
 
-A research plugin written for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): analysis straight-through. Pick a data file, complete a plan in a few clicks, run it into a run record with an input snapshot and an environment lock, then export it as an HTML/PDF report and three-line tables in Word/Excel.
+A research plugin written for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): Analysis Runner. Pick a data file, complete a plan in a few clicks, run it into a run record with an input snapshot and an environment lock, then export it as an HTML/PDF report and three-line tables in Word/Excel.
 
 Version 0.2.0 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
@@ -10,7 +10,7 @@ Version 0.2.0 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@loc
 
 A one-off script can compute a result, but six months later it usually cannot answer three questions: which data was used, which version of the environment it ran in, and why those few people were excluded. And when a second run produces different numbers, there is no way to tell whether the data changed or the code changed.
 
-Analysis straight-through makes every run an immutable snapshot: the input CSV, study definition, plan, exclusion list, environment versions, copies and hashes of the engine, Host, client and shared helper code, node models, tables and reports are saved together. Each run has its own directory and a unique `runId`, and completed runs are never overwritten; a new analysis can point at an earlier run with `revisionOf`. Sources and artifacts both have hashes, and if an artifact is corrupted the results are hidden rather than shown as a mixed version.
+Analysis Runner makes every run an immutable snapshot: the input CSV, study definition, plan, exclusion list, environment versions, copies and hashes of the engine, Host, client and shared helper code, node models, tables and reports are saved together. Each run has its own directory and a unique `runId`, and completed runs are never overwritten; a new analysis can point at an earlier run with `revisionOf`. Sources and artifacts both have hashes, and if an artifact is corrupted the results are hidden rather than shown as a mixed version.
 
 ## What it does
 
