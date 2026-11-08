@@ -2,7 +2,7 @@
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)写的研究插件:分析直通。选定数据文件、点几下完成方案、跑出一个带输入快照与环境锁的运行记录,再导出成 HTML/PDF 报告和三线表 Word/Excel。
 
-版本 0.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh33028-netizen/dsh-research-core)
+版本 0.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
 ## 为什么需要它
 
@@ -94,15 +94,15 @@ save('group_means', means)
 ## 安装
 
 ```powershell
-git clone https://github.com/yyh33028-netizen/dsh-research-core.git
-git clone https://github.com/yyh33028-netizen/dsh-analysis-run.git
+git clone https://github.com/yyh2030/dsh-research-core.git
+git clone https://github.com/yyh2030/dsh-analysis-run.git
 dsh plugin --profile <profile> add link:<父目录>\dsh-analysis-run
 ```
 
 或者用 git 形式:
 
 ```powershell
-dsh plugin --profile <profile> add git+https://github.com/yyh33028-netizen/dsh-analysis-run.git
+dsh plugin --profile <profile> add git+https://github.com/yyh2030/dsh-analysis-run.git
 ```
 
 两种方式都要求 `research-core` 与本插件同级,插件用相对路径 `../research-core/host.mjs` 引用共享核心。仓库是私有的,安装前需要有访问权限。装完重启承载 `dsh web` 的进程。
