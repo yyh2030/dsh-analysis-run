@@ -2,13 +2,13 @@
  * 刷新分析数据：把最新的行为/问卷数据合并成分析数据集，更新方案，重跑分析并导出。
  *
  * 用法（在任意目录）：
- *   node "D:\dsh-plugins\analysis-run\tools\refresh-dataset.mjs"            # 合并 → 有新数据则更新并重跑
- *   node "...\refresh-dataset.mjs" --dry-run                                 # 只合并、只报告，不改方案、不重跑
- *   node "...\refresh-dataset.mjs" --force                                   # 数据没变也重跑一次分析
+ *   node tools/refresh-dataset.mjs --study <study.json>                      # 合并 → 有新数据则更新并重跑
+ *   node tools/refresh-dataset.mjs --study <study.json> --dry-run             # 只合并、只报告
+ *   node tools/refresh-dataset.mjs --study <study.json> --force               # 数据没变也重跑一次分析
  *
  * 行为：
  *   1. 在临时目录复制一份最小研究状态（人口学/分数/排除/缓存），用私有管道跑 --stage all；
- *      源数据（DDT/IDM、D:\yyh-lab）不被修改。
+ *      源数据目录不被修改。
  *   2. 比较新合并数据与当前冻结数据的 sha256；没变就停（除非 --force）。
  *   3. 变了就：复制成新冻结文件 → 备份并更新 plan.json 的 dataPath → 重跑分析 → 导出报告。
  * 输出：一行 JSON 摘要（n、数据集 hash、runId、导出 revision、统计量）。
@@ -19,11 +19,14 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import os from 'node:os'
 import path from 'node:path'
 
-const STUDY = 'D:/dsh-research-upgrade/20261030-1103/private/study.json'
-const ANALYSIS_DIR = 'D:/yyh-lab/analysis'
+// 研究路径与输出目录都由参数或环境变量提供，仓库里不写死任何本机研究。
+const argValue = name => { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] : null }
+const STUDY = process.env.DSH_REFRESH_STUDY || argValue('--study')
+if (!STUDY) { console.error('需要 --study <study.json> 或 DSH_REFRESH_STUDY'); process.exit(2) }
+const PLUGIN = path.resolve(import.meta.dirname, '..')
+const CORE = path.resolve(PLUGIN, '../research-core')
+const ANALYSIS_DIR = process.env.DSH_REFRESH_ANALYSIS || argValue('--analysis-dir') || path.join(readJson(STUDY).dataRoot || '.', 'analysis')
 const MERGED_DIR = path.join(ANALYSIS_DIR, 'merged')
-const CORE = 'D:/dsh-plugins/research-core'
-const PLUGIN = 'D:/dsh-plugins/analysis-run'
 const flags = new Set(process.argv.slice(2))
 const dryRun = flags.has('--dry-run')
 const force = flags.has('--force')
@@ -38,6 +41,7 @@ function fail(message, detail) {
 }
 
 const study = readJson(STUDY)
+const LAB_ROOT = path.resolve(process.env.DSH_REFRESH_LAB || study.dataRoot || '.')
 const legacy = study.plugins?.analysisLegacy || {}
 const projectRoot = legacy.projectRoot
 const rawDir = legacy.rawDir
@@ -58,14 +62,14 @@ if (existsSync(runsDir)) {
 }
 
 // 1) 临时工作区：只复制管道需要的输入，源目录不改
-const work = mkdtempSync(path.join(os.tmpdir(), 'yyh-refresh-'))
+const work = mkdtempSync(path.join(os.tmpdir(), 'analysis-refresh-'))
 const inputs = ['demographics.json', 'scores.csv', 'scores_detail.csv', 'scores-manifest.json', 'state.json', 'schedule.json', 'exclusions.csv', 'ops-adapter-state.json']
 for (const name of inputs) {
-  const source = path.join('D:/yyh-lab', name)
+  const source = path.join(LAB_ROOT, name)
   if (existsSync(source)) copyFileSync(source, path.join(work, name))
 }
 for (const dir of ['cache', 'scales']) {
-  const source = path.join('D:/yyh-lab', dir)
+  const source = path.join(LAB_ROOT, dir)
   if (existsSync(source)) spawnSync('cmd', ['/c', 'xcopy', source.replace(/\//g, '\\'), path.join(work, dir), '/E', '/I', '/Q', '/Y'], { windowsHide: true })
 }
 

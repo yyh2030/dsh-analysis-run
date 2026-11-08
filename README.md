@@ -73,7 +73,7 @@ project, review changes before running, and never point them at untrusted files.
 Because the panel is a Harness plugin, you can skip the form entirely and ask in the
 conversation, for example:
 
-> 用当前分析数据跑 AUC_T2 在 salience × intervention 上的 ANCOVA，控制 AUC_T0，然后导出报告。
+> 用当前分析数据跑 outcome 在 group × condition 上的 ANCOVA，控制 baseline，然后导出报告。
 
 The Agent maps that to the plan, calls the same `run`/`export` actions and reports back.
 Useful for one-off models, re-running after data updates, or producing a written summary.

@@ -39,8 +39,9 @@ function arg(name) {
   return index >= 0 ? process.argv[index + 1] : null
 }
 const checkOnly = process.argv.includes('--check')
-const python = arg('--python') || process.env.DSH_ANALYSIS_PYTHON
-  || 'C:/Users/16787/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe'
+const home = process.env.DSH_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh')
+const runtimePython = path.join(home, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', process.platform === 'win32' ? 'python.exe' : 'bin/python3')
+const python = arg('--python') || process.env.DSH_ANALYSIS_PYTHON || runtimePython
 
 function run(args, env = {}) {
   return spawnSync(python, args, { encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, ...env } })
