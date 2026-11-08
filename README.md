@@ -4,7 +4,7 @@
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)写的研究插件:分析直通。选定数据文件、点几下完成方案、跑出一个带输入快照与环境锁的运行记录,再导出成 HTML/PDF 报告和三线表 Word/Excel。
 
-版本 0.2.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
+版本 0.3.0 · 需要 DSH ≥ 0.2.2-rc.1 · MIT 许可 · 依赖 [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
 ## 为什么需要它
 

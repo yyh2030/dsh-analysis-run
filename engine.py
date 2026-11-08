@@ -14,7 +14,7 @@ import sys
 import uuid
 import re as _re
 
-VERSION = 'analysis-engine/2.1.0'
+VERSION = 'analysis-engine/2.2.0'
 MODULES = ('descriptives', 'sample', 'sensitivity', 'correlation', 'reliability', 'ttest', 'anova', 'mediation', 'regression', 'paired', 'mixed', 'script')
 # 每个模块需要的本地依赖；缺后端时显示"环境待准备"，不能悄悄换成别的检验。
 BACKENDS = {'descriptives': ('numpy', 'pandas'), 'sample': ('numpy', 'pandas'), 'sensitivity': ('numpy', 'pandas'), 'correlation': ('numpy', 'pandas'), 'reliability': ('numpy', 'pandas'), 'ttest': ('numpy', 'pandas'), 'anova': ('numpy', 'pandas', 'statsmodels'), 'mediation': ('numpy', 'pandas', 'statsmodels'), 'script': ('numpy', 'pandas'), 'regression': ('numpy', 'pandas', 'statsmodels'),
@@ -140,6 +140,11 @@ def validate(plan):
             if any(not isinstance(c,str) or not c for c in spec['items']): raise ValueError('reliability items must be column names')
             reverse=spec.get('reverse') or []
             if not isinstance(reverse,list) or any(not isinstance(c,str) for c in reverse): raise ValueError('reliability.reverse must be a list')
+            declared=spec.get('range')
+            if declared is not None:
+                if not isinstance(declared,list) or len(declared)!=2 or not all(isinstance(value,(int,float)) and not isinstance(value,bool) for value in declared):
+                    raise ValueError('reliability.range must be [min,max] numbers')
+                if declared[0] >= declared[1]: raise ValueError('reliability.range min must be < max')
     if 'ttest' in plan:
         spec=plan['ttest']
         if not isinstance(spec,dict): raise ValueError('ttest must be an object')
@@ -269,6 +274,106 @@ def read_data(path, plan):
         data[col]=number
     for col in plan.get('groupColumns',[]): data[col]=data[col].replace('',np.nan)
     return data, transform_ops
+
+
+def module_columns(plan, module):
+    """每个模块实际需要的列，全部来自方案声明而不是"数据里有什么"。
+
+    返回 (required, numeric, categorical)。缺列在 prepare_frame 里直接失败，
+    不会过滤掉不存在的列再假装检查通过。
+    """
+    idcol = plan['idColumn']; outcome = plan['outcome']
+    groups = list(plan.get('groupColumns') or [])
+    covariates = list(plan.get('covariates') or [])
+    if module == 'descriptives':
+        return [idcol, outcome] + groups, [outcome], groups
+    if module == 'sample':
+        specs = plan.get('sampleColumns') or []
+        required = _unique([idcol] + [spec['column'] for spec in specs if spec.get('column')] + groups)
+        numeric = _unique([spec['column'] for spec in specs if spec.get('column') and spec.get('kind', 'numeric') == 'numeric'])
+        categorical = _unique([spec['column'] for spec in specs if spec.get('column') and spec.get('kind') == 'categorical'] + groups)
+        return required, numeric, categorical
+    if module == 'sensitivity':
+        return [idcol, outcome] + groups, [outcome], groups
+    if module == 'correlation':
+        spec = plan.get('correlation') or {}
+        cols = list(spec.get('columns') or []); partial = list(spec.get('partial') or []); by = list(spec.get('by') or [])
+        return [idcol] + cols + partial + by, cols + partial, by
+    if module == 'reliability':
+        items = [item for spec in (plan.get('reliability') or []) for item in (spec.get('items') or [])]
+        return [idcol] + items, items, []
+    if module == 'ttest':
+        spec = plan.get('ttest') or {}; measured = spec.get('outcome') or outcome
+        required = [idcol, measured]
+        categorical = []
+        if spec.get('kind', 'independent') == 'independent' and spec.get('group'):
+            required.append(spec['group']); categorical.append(spec['group'])
+        return required, [measured], categorical
+    if module == 'anova':
+        spec = plan.get('anova') or {}; measured = spec.get('outcome') or outcome; factors = list(spec.get('factors') or [])
+        return [idcol, measured] + factors, [measured], factors
+    if module == 'mediation':
+        spec = plan.get('mediation') or {}
+        cols = [spec.get('x'), spec.get('m'), spec.get('y')] + list(spec.get('covariates') or [])
+        cols = [column for column in cols if column]
+        return [idcol] + cols, cols, []
+    if module == 'regression':
+        return [idcol, outcome] + groups + covariates, [outcome] + covariates, groups
+    if module == 'paired':
+        if plan.get('layout', 'wide') == 'long':
+            within = plan.get('within') or {}
+            column = within.get('column', '')
+            return [idcol, column, outcome], [outcome], [column]
+        cols = list(plan.get('pairedColumns') or [])
+        return [idcol] + cols, cols, []
+    if module == 'mixed':
+        within = plan.get('within') or {}; column = within.get('column', '')
+        return [idcol, column, outcome] + groups + covariates, [outcome] + covariates, [column] + groups
+    return [idcol], [], []
+
+
+BLANK_TOKENS = {'', 'na', 'n/a', 'nan', 'none', 'null', '.', 'missing'}
+
+
+def _unique(values):
+    seen = set(); out = []
+    for value in values:
+        if value in seen: continue
+        seen.add(value); out.append(value)
+    return out
+
+
+def _coerce_numeric(frame, columns, module):
+    import numpy as np
+    import pandas as pd
+    for column in columns:
+        raw = frame[column]
+        text = raw.astype('object').map(lambda value: '' if value is None else str(value).strip().lower())
+        blank = raw.isna() | text.isin(BLANK_TOKENS)
+        number = pd.to_numeric(raw.where(~blank), errors='coerce')
+        invalid = ~blank & number.isna()
+        if invalid.any():
+            examples = [str(raw[index])[:24] for index in list(raw[invalid].index)[:3]]
+            raise ValueError(f'{module}: 列 {column} 含无法解析为数值的内容（行 {",".join(str(i + 2) for i in invalid[invalid].index[:3])}）：{examples}')
+        if np.isinf(number).any():
+            raise ValueError(f'{module}: 列 {column} 含无穷值')
+        frame[column] = number
+    return frame
+
+
+def prepare_frame(data, plan, module):
+    """按模块声明的列准备 frame：缺列直接失败，空白统一为缺失，非法数值/无穷报错。
+
+    预览、门槛与执行共用这一层，保证"人数"与"实际进入模型的观测"是同一批行。
+    """
+    required, numeric, categorical = module_columns(plan, module)
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise ValueError(f'{module}: 数据缺少列 {", ".join(missing)}')
+    frame = data.copy()
+    if module != 'script':
+        _coerce_numeric(frame, numeric, module)
+    return frame, {'module': module, 'required': required, 'numeric': numeric, 'categorical': categorical}
 
 
 def environment():
@@ -591,43 +696,87 @@ def mixed(data,plan):
                   'coefficients':coefficients(model)})
 
 
-def sample_table(data,plan):
-    """样本特征表（Table 1）：数值变量给均值/SD/中位数/缺失，分类变量给各水平计数与百分比；
-    按第一个分组列分层，同时给"整体"。数值与百分比都不做四舍五入以外的处理。"""
+def sample_table(data, plan):
+    """样本特征表（Table 1）：先按 participantId 去重成一人一行，再算人数/均值/SD/百分比。
+
+    同一编号在不同行里同一列出现不同值（如年龄 20 与 30）时明确拒绝，不静默取第一行；
+    分类变量的百分比以该 scope 下非缺失人数为分母，缺失单独计数。
+    """
     import numpy as np
     import pandas as pd
-    specs=plan.get('sampleColumns') or []
+    specs = plan.get('sampleColumns') or []
     if not specs: raise ValueError('sample table needs sampleColumns')
-    groups=plan.get('groupColumns') or []
-    group=groups[0] if groups else None
-    rows=[]
+    idcol = plan['idColumn']
+    groups = plan.get('groupColumns') or []
+    columns = [spec['column'] for spec in specs]
+    frame = data[_unique([idcol] + columns + groups)]
+
+    people = {}
+    for _, row in frame.iterrows():
+        pid = str(row[idcol]).strip()
+        if not pid: continue
+        person = people.setdefault(pid, {'values': {}, 'groups': {}, 'conflicts': set()})
+        for column in columns:
+            value = row[column]
+            if value is None or value is pd.NA or (isinstance(value, float) and np.isnan(value)):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            if column in person['values'] and str(person['values'][column]) != text:
+                person['conflicts'].add(column)
+            else:
+                person['values'][column] = value
+        for group in groups:
+            value = row[group]
+            text = '' if value is None or (isinstance(value, float) and np.isnan(value)) else str(value).strip()
+            if not text: continue
+            if group in person['groups'] and str(person['groups'][group]) != text:
+                person['conflicts'].add(group)
+            else:
+                person['groups'][group] = value
+
+    conflicted = {pid: sorted(person['conflicts']) for pid, person in people.items() if person['conflicts']}
+    if conflicted:
+        example = next(iter(conflicted.items()))
+        raise ValueError(f'样本特征表：同一编号的特征值不一致（如 {example[0]} 的 {",".join(example[1])}），需要先确认取哪个访视或修正来源')
+
+    per_person = pd.DataFrame([
+        {'_id': pid, **person['values'], **{group: person['groups'].get(group) for group in groups}}
+        for pid, person in people.items()
+    ])
+    group = groups[0] if groups else None
+    rows = []
     for spec in specs:
-        column=spec['column']; kind=spec.get('kind','numeric'); label=spec.get('label') or column
-        if column not in data.columns: raise ValueError(f'sample column {column} not found')
-        scopes=[('整体',data)]
-        if group and group in data.columns:
-            for level in sorted(str(item) for item in data[group].dropna().unique()):
-                scopes.append((f'{group}={level}',data[data[group].astype(str)==level]))
-        for scope_name,frame in scopes:
-            raw=frame[column]
-            if kind=='numeric':
-                values=pd.to_numeric(raw.replace('',np.nan),errors='coerce')
-                valid=values.dropna()
-                rows.append({'variable':column,'label':label,'scope':scope_name,'kind':'数值','level':None,'n':int(valid.size),
-                             'mean':float(valid.mean()) if valid.size else None,
-                             'sd':float(valid.std(ddof=1)) if valid.size>1 else None,
-                             'median':float(valid.median()) if valid.size else None,
-                             'count':None,'percent':None,'missing':int(values.isna().sum())})
-            elif kind=='categorical':
-                series=raw.astype(str).replace('',np.nan)
-                counts=series.dropna().value_counts()
-                denominator=int(series.notna().sum())
-                missing=int(series.isna().sum())
+        column = spec['column']; kind = spec.get('kind', 'numeric'); label = spec.get('label') or column
+        scopes = [('整体', per_person)]
+        if group:
+            for level in sorted(str(item) for item in per_person[group].dropna().unique()):
+                scopes.append((f'{group}={level}', per_person[per_person[group].astype(str) == level]))
+        for scope_name, scope_frame in scopes:
+            raw = scope_frame[column] if column in scope_frame.columns else pd.Series(dtype=object)
+            denominator_people = int(len(scope_frame))
+            if kind == 'numeric':
+                values = pd.to_numeric(raw, errors='coerce')
+                valid = values.dropna()
+                rows.append({'variable': column, 'label': label, 'scope': scope_name, 'kind': '数值', 'level': None,
+                             'n': int(valid.size),
+                             'mean': float(valid.mean()) if valid.size else None,
+                             'sd': float(valid.std(ddof=1)) if valid.size > 1 else None,
+                             'median': float(valid.median()) if valid.size else None,
+                             'count': None, 'percent': None,
+                             'missing': int(denominator_people - valid.size)})
+            elif kind == 'categorical':
+                series = raw.astype('object').map(lambda value: '' if value is None else str(value).strip()).replace('', np.nan)
+                counts = series.dropna().value_counts()
+                denominator = int(series.notna().sum())
+                missing = int(denominator_people - denominator)
                 for level in sorted(str(item) for item in counts.index):
-                    count=int(counts[level])
-                    rows.append({'variable':column,'label':label,'scope':scope_name,'kind':'分类','level':level,'n':denominator,
-                                 'mean':None,'sd':None,'median':None,'count':count,
-                                 'percent':round(100.0*count/denominator,1) if denominator else None,'missing':missing})
+                    count = int(counts[level])
+                    rows.append({'variable': column, 'label': label, 'scope': scope_name, 'kind': '分类', 'level': level,
+                                 'n': denominator, 'mean': None, 'sd': None, 'median': None,
+                                 'count': count, 'percent': round(100.0 * count / denominator, 1) if denominator else None,
+                                 'missing': missing})
             else:
                 raise ValueError(f'sample column {column}: kind must be numeric or categorical')
     return rows
@@ -709,38 +858,75 @@ def _bh(rows, key='p'):
     for index,value in adjusted.items(): rows[index][key+'_adjusted']=value
 
 
+def _fisher_ci_with_df(r, n, df, level=0.95):
+    import math
+    if n <= 3 or abs(r) >= 1 or df <= 1: return (None, None)
+    z = math.atanh(r); se = 1.0 / math.sqrt(n - 3)
+    critical = t_critical(df, level) or 1.959963984540054
+    return (math.tanh(z - critical * se), math.tanh(z + critical * se))
+
+
+def _partial_stats(frame, x, y, controls):
+    """偏相关：用安全内部矩阵做残差化，自由度按控制设计秩扣除。
+
+    列名不进入公式，因此空格、中文、符号列名都安全；控制变量共线时按设计秩计算，
+    秩满时等价于普通偏相关，秩亏时 df 相应减少而不是假装满秩。
+    """
+    import numpy as np
+    xv = frame[x].to_numpy(dtype=float); yv = frame[y].to_numpy(dtype=float)
+    controls_matrix = frame[controls].to_numpy(dtype=float)
+    design = np.column_stack([np.ones(len(frame)), controls_matrix]) if controls_matrix.size else np.ones((len(frame), 1))
+    rank = int(np.linalg.matrix_rank(design))
+    rx = xv - design @ np.linalg.lstsq(design, xv, rcond=None)[0]
+    ry = yv - design @ np.linalg.lstsq(design, yv, rcond=None)[0]
+    stats = _pearson(rx, ry)
+    if not stats: return None
+    df = stats['n'] - 2 - max(0, rank - 1)
+    if df <= 0: return {'n': stats['n'], 'r': stats['r'], 't': None, 'df': df, 'p': None}
+    r = stats['r']
+    t = None if abs(r) >= 1 else r * (df / max(1e-12, 1 - r * r)) ** 0.5
+    return {'n': stats['n'], 'r': r, 't': t, 'df': df, 'p': _t_two_sided(t, df) if t is not None else None}
+
+
 def correlation(data, plan):
     import numpy as np
     import pandas as pd
     spec=plan['correlation']
     columns=spec['columns']; method=spec.get('method','pearson'); partial=spec.get('partial') or []
     by=spec.get('by') or []
+    gate=int((plan.get('gate') or {}).get('minSubjects',30))
     frame=data[[plan['idColumn']]+columns+partial+by].dropna()
     scopes=[('整体', frame)]
     if by:
         for key, group in frame.groupby(by, dropna=True):
             label=key if isinstance(key,str) else '|'.join(str(item) for item in (key if isinstance(key,tuple) else [key]))
             scopes.append((str(label), group))
-    rows=[]
+    rows=[]; skipped=[]
     for scope, frame_scope in scopes:
+        # 每个 scope 独立判门槛：整体 40 人不能给一个只有 4 个观测的分组放行。
+        if len(frame_scope) < gate:
+            skipped.append({'scope': scope, 'eligible': int(len(frame_scope))})
+            continue
+        values = frame_scope.copy()
+        if method == 'spearman':
+            # Spearman 的受支持定义：先把所有参与变量（含控制变量）转成秩，再残差化。
+            for column in columns + partial:
+                values[column] = values[column].rank()
         for i in range(len(columns)):
             for j in range(i+1,len(columns)):
                 x=columns[i]; y=columns[j]
-                left=frame_scope[x]; right=frame_scope[y]
                 if partial:
-                    import statsmodels.formula.api as smf
-                    controls=' + '.join(partial)
-                    left=smf.ols(f'_x ~ {controls}', data=pd.DataFrame({'_x':frame_scope[x], **{c:frame_scope[c] for c in partial}})).fit().resid
-                    right=smf.ols(f'_y ~ {controls}', data=pd.DataFrame({'_y':frame_scope[y], **{c:frame_scope[c] for c in partial}})).fit().resid
-                if method=='spearman':
-                    left=left.rank(); right=right.rank()
-                stats=_pearson(left, right)
-                if not stats: continue
-                low, high=_fisher_ci(stats['r'], stats['n'])
+                    stats=_partial_stats(values, x, y, partial)
+                    if not stats: continue
+                    low, high=_fisher_ci_with_df(stats['r'], stats['n'], stats['df'])
+                else:
+                    stats=_pearson(values[x], values[y])
+                    if not stats: continue
+                    low, high=_fisher_ci(stats['r'], stats['n'])
                 rows.append({'scope':scope,'x':x,'y':y,'method':method,'partial':','.join(partial) or None,
                              'n':stats['n'],'r':stats['r'],'ciLow':low,'ciHigh':high,'t':stats['t'],'df':stats['df'],'p':stats['p']})
     if spec.get('correct')=='bh': _bh(rows)
-    return rows
+    return {'rows': rows, 'skipped': skipped}
 
 
 def reliability(data, plan):
@@ -750,25 +936,36 @@ def reliability(data, plan):
     for spec in plan['reliability']:
         items=spec['items']; reverse=spec.get('reverse') or []
         frame=data[items].apply(pd.to_numeric, errors='coerce')
+        declared=spec.get('range')
+        if declared:
+            low, high = float(declared[0]), float(declared[1])
+            endpoint_source='declared'
+        else:
+            low, high = float(frame.min().min()), float(frame.max().max())
+            endpoint_source='observed'
         for column in reverse:
             if column in frame.columns:
-                frame[column]=frame[column].max()+frame[column].min()-frame[column]
+                # 反向题按量尺端点翻转（1—5 → 6−x）；样本端点只在方案未声明量尺时兜底。
+                frame[column]=low + high - frame[column]
         frame=frame.dropna()
         n=len(frame); k=len(items)
+        name=spec.get('name') or '+'.join(items)
         if n<3 or k<2:
-            rows.append({'name':spec.get('name') or '+'.join(items),'n':n,'k':k,'alpha':None,'missing':int(len(data)-n)})
+            rows.append({'name':name,'n':n,'k':k,'alpha':None,'missing':int(len(data)-n),'reverseSource':endpoint_source})
             continue
         total=frame.sum(axis=1)
         if float(total.var(ddof=1))<=0:
-            rows.append({'name':spec.get('name') or '+'.join(items),'n':n,'k':k,'alpha':None,'missing':int(len(data)-n)})
+            rows.append({'name':name,'n':n,'k':k,'alpha':None,'missing':int(len(data)-n),'reverseSource':endpoint_source})
             continue
         alpha=k/(k-1)*(1-float(frame.var(ddof=1).sum())/float(total.var(ddof=1)))
-        item_total=[float(np.corrcoef(frame[item], total)[0,1]) for item in items]
+        # 题总相关采用 corrected item-total（该题与"其余题目之和"的相关），不再包含自身。
+        item_total=[float(np.corrcoef(frame[item], total-frame[item])[0,1]) for item in items]
         inter=[float(np.corrcoef(frame[a], frame[b])[0,1]) for i,a in enumerate(items) for b in items[i+1:]]
-        rows.append({'name':spec.get('name') or '+'.join(items),'n':n,'k':k,'alpha':alpha,
+        rows.append({'name':name,'n':n,'k':k,'alpha':alpha,
                      'itemTotalMin':min(item_total),'itemTotalMax':max(item_total),
                      'meanInterItem':float(np.mean(inter)) if inter else None,
-                     'missing':int(len(data)-n)})
+                     'missing':int(len(data)-n),'reverseSource':endpoint_source,
+                     'itemTotalType':'corrected'})
     return rows
 
 
@@ -782,7 +979,9 @@ def ttest(data, plan):
         sample=values.dropna(); n=len(sample); mu=float(spec['mu'])
         if n<3: raise ValueError('one-sample ttest needs at least three observations')
         mean=float(sample.mean()); sd=float(sample.std(ddof=1)); se=sd/np.sqrt(n)
-        t=mean-mu if se==0 else (mean-mu)/se
+        if sd == 0:
+            raise ValueError(f'单样本 t 检验不可估计：样本零方差（n={n}，全部观测相同）')
+        t=(mean-mu)/se
         critical=t_critical(n-1) or 1.959963984540054
         rows.append({'kind':'单样本','comparison':f'{outcome} vs {mu}','n':n,'mean1':mean,'mean2':mu,'meanDiff':mean-mu,
                      'se':se,'t':t,'df':n-1,'p':_t_two_sided(t,n-1),'ciLow':(mean-mu)-critical*se,'ciHigh':(mean-mu)+critical*se,
@@ -797,7 +996,9 @@ def ttest(data, plan):
         n1,n2=len(left),len(right)
         m1,m2=float(left.mean()),float(right.mean()); sd1,sd2=float(left.std(ddof=1)),float(right.std(ddof=1))
         se=np.sqrt(sd1**2/n1+sd2**2/n2)
-        t=(m1-m2)/se if se>0 else None
+        if se == 0:
+            raise ValueError('独立样本 t 检验不可估计：两组合并标准误为 0（每组方差均为 0）')
+        t=(m1-m2)/se
         df=(sd1**2/n1+sd2**2/n2)**2/((sd1**2/n1)**2/(n1-1)+(sd2**2/n2)**2/(n2-1)) if se>0 else None
         pooled=np.sqrt(((n1-1)*sd1**2+(n2-1)*sd2**2)/(n1+n2-2)) if n1+n2>2 else None
         critical=t_critical(df) if df else None
@@ -959,32 +1160,61 @@ def run_script(data, plan):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def eligible_subjects(data,plan,module):
-    idcol=plan['idColumn']; cols=[plan['outcome']]+plan.get('groupColumns',[])+plan.get('covariates',[])
-    if module in ('sample','sensitivity','descriptives','script'): return int(data[idcol].nunique())
-    if module=='correlation':
-        spec=plan['correlation']; use=[c for c in spec['columns']+ (spec.get('partial') or []) + (spec.get('by') or []) if c in data.columns]
-        return int(data.dropna(subset=use)[idcol].nunique())
-    if module=='reliability':
-        items=[item for spec in plan['reliability'] for item in spec['items'] if item in data.columns]
-        return int(data.dropna(subset=items)[idcol].nunique())
-    if module=='ttest':
-        spec=plan['ttest']; use=[spec.get('outcome') or plan['outcome']]
-        if spec.get('kind','independent')=='independent': use.append(spec['group'])
-        return int(data.dropna(subset=[c for c in use if c in data.columns])[idcol].nunique())
-    if module=='anova':
-        spec=plan['anova']; use=[spec.get('outcome') or plan['outcome']]+spec['factors']
-        return int(data.dropna(subset=[c for c in use if c in data.columns])[idcol].nunique())
-    if module=='mediation':
-        spec=plan['mediation']; use=[spec['x'],spec['m'],spec['y']]+(spec.get('covariates') or [])
-        return int(data.dropna(subset=[c for c in use if c in data.columns])[idcol].nunique())
-    if module=='paired':
-        if plan.get('layout','wide')=='wide': return int(data.dropna(subset=plan.get('pairedColumns',[]))[idcol].nunique())
-        within=plan.get('within') or {}; levels=within.get('levels',[])
-        if len(levels)==2:
-            counts=data[data[within['column']].isin(levels)].dropna(subset=[plan['outcome']]).groupby(idcol)[within['column']].nunique()
-            return int(counts.eq(2).sum())
-    return int(data.dropna(subset=cols)[idcol].nunique())
+def eligible_ids(data, plan, module):
+    """模块实际可用的独立参与者编号（已按该模块声明列做完整观测过滤）。
+
+    预览、门槛和执行都用它，避免"整体 40 人放行、实际只有 4 个观测"。
+    """
+    idcol = plan['idColumn']
+    columns = {column: data[column] for column in data.columns}
+    def ids(frame):
+        return sorted({str(value) for value in frame[idcol].dropna()})
+    if module in ('sample', 'sensitivity', 'descriptives', 'script'):
+        return ids(data)
+    if module == 'correlation':
+        spec = plan['correlation']
+        use = [column for column in spec['columns'] + (spec.get('partial') or []) if column in columns]
+        frame = data.dropna(subset=use) if use else data
+        if spec.get('by'):
+            frame = frame.dropna(subset=[column for column in spec['by'] if column in columns])
+        return ids(frame)
+    if module == 'reliability':
+        items = [item for spec in plan['reliability'] for item in spec['items'] if item in columns]
+        return ids(data.dropna(subset=items))
+    if module == 'ttest':
+        spec = plan['ttest']
+        use = [spec.get('outcome') or plan['outcome']]
+        if spec.get('kind', 'independent') == 'independent':
+            use.append(spec['group'])
+        return ids(data.dropna(subset=[column for column in use if column in columns]))
+    if module == 'anova':
+        spec = plan['anova']
+        use = [spec.get('outcome') or plan['outcome']] + spec['factors']
+        return ids(data.dropna(subset=[column for column in use if column in columns]))
+    if module == 'mediation':
+        spec = plan['mediation']
+        use = [spec['x'], spec['m'], spec['y']] + (spec.get('covariates') or [])
+        return ids(data.dropna(subset=[column for column in use if column in columns]))
+    if module == 'paired':
+        if plan.get('layout', 'wide') == 'wide':
+            return ids(data.dropna(subset=plan.get('pairedColumns', [])))
+        within = plan.get('within') or {}
+        levels = within.get('levels', [])
+        if len(levels) == 2:
+            subset = data[data[within['column']].isin(levels)].dropna(subset=[plan['outcome']])
+            counts = subset.groupby(idcol)[within['column']].nunique()
+            return sorted({str(value) for value in counts[counts.eq(2)].index})
+        return []
+    if module == 'mixed':
+        within = plan.get('within') or {}
+        use = [plan['outcome'], within.get('column', '')] + (plan.get('groupColumns') or []) + (plan.get('covariates') or [])
+        return ids(data.dropna(subset=[column for column in use if column in columns]))
+    cols = [plan['outcome']] + (plan.get('groupColumns') or []) + (plan.get('covariates') or [])
+    return ids(data.dropna(subset=[column for column in cols if column in columns]))
+
+
+def eligible_subjects(data, plan, module):
+    return len(eligible_ids(data, plan, module))
 
 
 def table_frame(rows):
@@ -1130,18 +1360,21 @@ def run(request):
             if missing_backend:
                 meta['nodes'][module]={'status':'not_run','dependsOn':['prepare'],'reason':'环境待准备：缺少 '+', '.join(missing_backend)}
                 continue
-            eligible=eligible_subjects(data,plan,module)
-            if module!='descriptives' and eligible<minimum:
-                meta['nodes'][module]={'status':'not_run','dependsOn':['prepare'],'reason':f'{eligible} eligible participants < gate {minimum}','eligibleSubjects':eligible}; continue
             try:
+                frame, schema = prepare_frame(data, plan, module)
+                ids = eligible_ids(frame, plan, module)
+                eligible=len(ids)
+                if module not in ('descriptives', 'sample', 'sensitivity', 'script') and eligible<minimum:
+                    meta['nodes'][module]={'status':'not_run','dependsOn':['prepare'],'reason':f'{eligible} eligible participants < gate {minimum}','eligibleSubjects':eligible}
+                    continue
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter('always')
-                    value=clean(functions[module](data,plan))
+                    value=clean(functions[module](frame,plan))
                 meta['warnings'] += [f'{module}: {warning.message}' for warning in caught]
                 if module=='descriptives':
                     put('descriptives','Descriptive statistics',value)
                     if plan.get('frequencies'):
-                        put('frequencies','Frequency tables',frequencies(data,plan))
+                        put('frequencies','Frequency tables',frequencies(frame,plan))
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'subjects':meta['subjects'],'observations':meta['observations']}}
                 elif module=='sample':
                     put('sample','Sample characteristics',value)
@@ -1149,6 +1382,9 @@ def run(request):
                 elif module=='sensitivity':
                     put('sensitivity','Sensitivity: complete cases',value)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'rows':len(value)}}
+                elif module=='correlation' and isinstance(value,dict) and isinstance(value.get('rows'),list):
+                    put('correlation','Correlation',value['rows'])
+                    meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'rows':len(value['rows']),'skippedScopes':value.get('skipped') or []}}
                 elif module=='script' and isinstance(value,dict) and isinstance(value.get('tables'),list):
                     for table in value['tables']:
                         put(table['key'], table.get('label') or table['key'], table['rows'])
@@ -1164,6 +1400,14 @@ def run(request):
                         if value.get('contrasts'): put('contrasts','Planned contrasts',value['contrasts'])
                     elif value.get('coefficients'): put(module,module,value['coefficients'])
                     else: put(module,module,[{k:v for k,v in value.items() if k!='subjectIds'}])
+                node = meta['nodes'].get(module)
+                if isinstance(node, dict) and node.get('status') == 'executed':
+                    base = node.get('result') if isinstance(node.get('result'), dict) else {}
+                    node['result'] = {**base, 'analysisSet': {
+                        'id': canonical({'module': module, 'ids': ids, 'columns': schema['required']})[:16],
+                        'n': eligible, 'observations': int(len(frame)), 'columns': schema['required'],
+                        'ruleVersion': VERSION,
+                    }}
             except Exception as error:
                 meta['nodes'][module]={'status':'failed','dependsOn':['prepare'],'reason':str(error)}
         meta['status']='partial' if any(v['status']=='failed' for v in meta['nodes'].values()) else 'ok'
@@ -1190,7 +1434,9 @@ def preview(request):
     for module in plan.get('analyses',[]):
         entry={'backends':BACKENDS.get(module,())}
         try:
-            entry['eligible']=eligible_subjects(data,plan,module)
+            frame, schema = prepare_frame(data, plan, module)
+            entry['eligible']=len(eligible_ids(frame, plan, module))
+            entry['columns']=schema['required']
         except Exception as error:
             entry['eligible']=None
             entry['error']=str(error)
