@@ -449,7 +449,7 @@ export function apply(ctx, config = {}) {
       const presentation = req.method === 'GET' && url.searchParams.get('action') === 'presentation'
       if ((req.headers['sec-fetch-site'] && !['same-origin','none'].includes(req.headers['sec-fetch-site'])) || (origin && new URL(origin).host !== req.headers.host) || (!figure && !presentation && req.headers['x-analysis-run'] !== '1')) throw new AnalysisError('forbidden', '拒绝跨站访问')
       if (presentation) {
-        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId') })
+        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId'), workspaceId: url.searchParams.get('workspaceId'), sessionId: url.searchParams.get('sessionId') })
         const { binding: view, data: result } = await binding.read(actor, () => results({ run: url.searchParams.get('run') }))
         void view
         const revision = String(url.searchParams.get('rev') || '')
@@ -470,7 +470,7 @@ export function apply(ctx, config = {}) {
         res.end(await readFile(target)); return
       }
       if (figure) {
-        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId') })
+        const actor = binding.pageActor({ req, pageId: url.searchParams.get('pageId'), workspaceId: url.searchParams.get('workspaceId'), sessionId: url.searchParams.get('sessionId') })
         const name = url.searchParams.get('name')
         const { binding: view, data: result } = await binding.read(actor, () => results({ run: url.searchParams.get('run') }))
         void view
@@ -483,7 +483,7 @@ export function apply(ctx, config = {}) {
         let body = ''; for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 1024*1024) throw new AnalysisError('invalid','请求体过大') }
         const parsed = JSON.parse(body || '{}'); name = parsed.action; payload = parsed.payload || {}
       } else throw new AnalysisError('method','只接受 GET / POST')
-      const actor = binding.pageActor({ req, pageId: payload.pageId })
+      const actor = binding.pageActor({ req, pageId: payload.pageId, workspaceId: payload.workspaceId, sessionId: payload.sessionId })
       respond(200,{ok:true,data:await action(actor, name, payload)})
     } catch(error) {
       const mapped = bindingStatus(error)
