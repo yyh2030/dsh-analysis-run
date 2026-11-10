@@ -13,6 +13,7 @@
   },
   "files": [
     "index.js",
+    "scheduler.mjs",
     "engine.py",
     "office_export.py",
     "vendor/wheels",

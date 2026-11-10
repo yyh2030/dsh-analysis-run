@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadStudyContext, validateStudyDefinition } from './study-context.mjs'
+import { createScheduler } from './scheduler.mjs'
 import { hostBinding, bindingStatus } from '../research-core/host.mjs'
 import { openResearchData } from '../research-core/data.mjs'
 import { openAnalysis, AnalysisError as CoreAnalysisError } from '../research-core/analysis.mjs'
@@ -94,6 +95,7 @@ function configFor(config) {
 export function apply(ctx, config = {}) {
   const VERSION = '0.2.0'
   let selected = configFor(config)
+  let autoScheduler = null
   function current() { return selected }
   const binding = hostBinding(ctx, {
     plugin: 'analysis-run',
@@ -142,12 +144,13 @@ export function apply(ctx, config = {}) {
   }
   function privateArgs(cfg, stage) { return ['--stage', stage, '--json', '--project-root', cfg.projectRoot, '--lab-dir', cfg.labDir, '--raw-dir', cfg.rawDir] }
   async function privateStatus(cfg) { const out = await python(cfg, cfg.pipelinePath, privateArgs(cfg, 'status')); if (!out.ok) throw new AnalysisError('python', out.error); return out }
-  async function runs(cfg) {
+  async function runs(cfg, study = null) {
     let entries; try { entries = await readdir(path.join(cfg.outputDir, 'runs'), { withFileTypes: true }) } catch { return [] }
     const list = []
+    const studyId = (study || current().context).id
     for (const entry of entries.filter(e => e.isDirectory()).sort((a,b) => b.name.localeCompare(a.name))) {
       const meta = await readJson(path.join(cfg.outputDir, 'runs', entry.name, 'meta.json'), null)
-      if (!meta || (meta.study && meta.study.id !== current().context.id)) continue
+      if (!meta || (meta.study && meta.study.id !== studyId)) continue
       // 被中断的运行：仍是 running，但记录里的进程已经不在了。
       let interrupted = false
       if (meta.status === 'running' && meta.process && meta.process.hostname === os.hostname() && Number.isInteger(Number(meta.process.pid))) {
@@ -209,7 +212,7 @@ export function apply(ctx, config = {}) {
     // core 来源的 dataPath 是运行时派生的，不算方案变更。
     const normalizePlan = value => { const clone = JSON.parse(JSON.stringify(value || {})); delete clone.dataPath; return JSON.stringify(clone) }
     const pendingChanges = Boolean(latest && (sourceChanged || normalizePlan(latest.plan) !== normalizePlan(plan) || JSON.stringify(latest.excludedIds || []) !== JSON.stringify(items.map(row => row.id).sort())))
-    return { ...base, busy: LOCKS.get(cfg.outputDir) || null, queued: PENDING.has(cfg.outputDir), autoError: autoError || null, autoTicks, backends, backendsSource, vendor, runs: history, lastRun: history[0] || null, source, pendingChanges, exclusions: items, python: { configured: Boolean(cfg.pythonPath) }, paths: { outputDir: cfg.outputDir }, study: context.identity }
+    return { ...base, busy: LOCKS.get(cfg.outputDir) || null, queued: PENDING.has(cfg.outputDir), autoError: autoScheduler?.state().error || null, autoTicks: autoScheduler?.state().ticks || 0, backends, backendsSource, vendor, runs: history, lastRun: history[0] || null, source, pendingChanges, exclusions: items, python: { configured: Boolean(cfg.pythonPath) }, paths: { outputDir: cfg.outputDir }, study: context.identity }
   }
   async function results(query = {}) {
     const { cfg, context } = current(); const history = await runs(cfg); const id = String(query.run || query.runId || history[0]?.runId || '')
@@ -409,7 +412,7 @@ export function apply(ctx, config = {}) {
       await binding.read(actor, () => null)
       return { ...binding.capabilities(actor), study: current().context.identity }
     }
-    if (name === 'autoTick') { await autoTick(); return { ticked: true } }
+    if (name === 'autoTick') { await autoScheduler.tick(); return { ticked: true } }
     if (name === 'studyConnect') return await studyConnect(actor, payload)
     if (name === 'studySave') return await studySave(actor, payload)
     if (!Object.hasOwn(queries, name) && !['plan', 'run', 'exclude', 'export'].includes(name)) throw new AnalysisError('action', '未知操作')
@@ -606,83 +609,34 @@ export function apply(ctx, config = {}) {
   const escapeAttr = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]))
 
   /* ---------- 去抖自动运行（config.autoRun，默认关闭） ---------- */
-  let autoTimer = null
-  let autoDebounce = null
-  let autoBusy = false
-  let autoError = ''
-  let autoTicks = 0
-  let autoPausedKey = null
-  const autoDisposers = []
   function readInstanceId(dataRoot) {
     try { return JSON.parse(readFileSync(path.join(dataRoot, 'study-instance.json'), 'utf8')).instanceId || null } catch { return null }
   }
-  async function readAutoState() {
-    try { return JSON.parse(await readFile(path.join(current().cfg.outputDir, 'auto-state.json'), 'utf8')) } catch { return {} }
+  async function readAutoState(cfg) {
+    try { return JSON.parse(await readFile(path.join(cfg.outputDir, 'auto-state.json'), 'utf8')) } catch { return {} }
   }
-  async function writeAutoState(value) {
-    try { await writeFile(path.join(current().cfg.outputDir, 'auto-state.json'), JSON.stringify(value, null, 2)) } catch { /* 状态文件只是加速，不阻断运行 */ }
+  async function writeAutoState(cfg, value) {
+    try { await writeFile(path.join(cfg.outputDir, 'auto-state.json'), JSON.stringify(value, null, 2)) } catch { /* 状态文件只是加速，不阻断运行 */ }
   }
-  // 自动运行的"输入指纹"= 数据 hash + 完整方案 + 研究身份；只改方案/排除也要触发一次。
-  function autoRequestedKey(plan, built) {
-    return hash(JSON.stringify({ study: current().context.identity?.id || null, plan, dataset: built.hash }))
-  }
-  function scheduleDebounced(instanceId, key = null) {
-    if (autoDebounce) clearTimeout(autoDebounce)
-    autoDebounce = setTimeout(() => {
-      autoDebounce = null
-      run({}, current(), { instanceId }).then(async () => {
-        autoError = ''
-        autoPausedKey = null
-        const state = await readAutoState()
-        await writeAutoState({ ...state, requestedKey: key, completedAt: new Date().toISOString() })
-      }).catch(error => {
-        autoError = String(error && error.message ? error.message : error)
-        // 失败暂停键=完整输入指纹：修方案后指纹变化，自动恢复。
-        autoPausedKey = key
-      })
-    }, Number(config.debounceMs) || 3000)
-    if (autoDebounce.unref) autoDebounce.unref()
-  }
-  async function autoTick() {
-    if (autoBusy) return
-    autoBusy = true
-    autoTicks += 1
-    try {
-      const { cfg, context } = current()
-      if (!context || !context.configured) return
-      if (LOCKS.has(cfg.outputDir) || WRITES.has(cfg.outputDir)) return
-      const plan = await planFor(cfg)
-      if (!plan || !plan.source || plan.source.type !== 'core') return
-      const instanceId = readInstanceId(context.dataRoot)
-      if (!instanceId) return
-      let built
-      try {
-        built = openAnalysis({ data: openResearchData({ study: context, instanceId }), study: context, owner: 'analysis-run' }).dataset({ plan })
-      } catch { return }
-      const requestedKey = autoRequestedKey(plan, built)
-      const state = await readAutoState()
-      if (state.requestedKey === requestedKey) return
-      const history = await runs(cfg)
-      if (!history.length) { if (!autoDebounce && autoPausedKey !== requestedKey) scheduleDebounced(instanceId, requestedKey); return }
-      const latest = await readJson(path.join(cfg.outputDir, 'runs', history[0].runId, 'meta.json'), null)
-      const latestHash = latest?.dataset?.hash || latest?.source?.sha256
-      const samePlan = JSON.stringify(latest?.plan || null) === JSON.stringify(plan || null)
-      if (latestHash === built.hash && samePlan) return
-      if (!autoDebounce && autoPausedKey !== requestedKey) scheduleDebounced(instanceId, requestedKey)
-    } finally {
-      autoBusy = false
-    }
-  }
-  function startAuto() {
-    if (!config.autoRun || autoTimer) return
-    autoTimer = setInterval(() => { autoTick().catch(() => {}) }, Number(config.autoPollMs) || 2000)
-    if (autoTimer.unref) autoTimer.unref()
-    autoDisposers.push(() => { clearInterval(autoTimer); autoTimer = null })
-    const initial = setTimeout(() => { autoTick().catch(() => {}) }, 50)
-    initial.unref?.()
-    autoDisposers.push(() => clearTimeout(initial))
-    autoDisposers.push(() => { if (autoDebounce) { clearTimeout(autoDebounce); autoDebounce = null } })
-  }
+  // 自动调度的纯逻辑都在 scheduler.mjs；这里只把工程依赖注入进去。
+  autoScheduler = createScheduler({
+    config,
+    current,
+    run,
+    analysis: {
+      planFor,
+      // 传入 tick 捕获的 context，避免 runs() 内部再读 current()。
+      runs: (cfg, studyState) => runs(cfg, studyState && studyState.context),
+      latestMeta: (cfg, runId) => readJson(path.join(cfg.outputDir, 'runs', runId, 'meta.json'), null),
+      dataset: ({ state: studyState, plan, instanceId }) => openAnalysis({ data: openResearchData({ study: studyState.context, instanceId }), study: studyState.context, owner: 'analysis-run' }).dataset({ plan }),
+      instanceId: context => readInstanceId(context.dataRoot),
+      // 对内存 LOCKS/WRITES 的检查作为 run 前 guard。
+      blocked: studyState => LOCKS.has(studyState.cfg.outputDir) || WRITES.has(studyState.cfg.outputDir),
+    },
+    readAutoState,
+    writeAutoState,
+  })
+  function startAuto() { return autoScheduler.start() }
   const attach = scope => scope.effect(() => scope.webServer.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route')
   const web = ctx.get?.('webServer'); if (web) ctx.effect(() => web.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route'); else ctx.inject(['webServer'],attach)
   const register = scope => {
@@ -718,7 +672,7 @@ export function apply(ctx, config = {}) {
   }
   const tools = ctx.get?.('tools'); if (tools) register({tools}); else ctx.inject(['tools'],register)
   startAuto()
-  ctx.effect(() => () => { for (const dispose of autoDisposers.splice(0)) { try { dispose() } catch { /* 已清理 */ } } }, 'analysis-run auto scheduler')
+  ctx.effect(() => () => { autoScheduler.dispose() }, 'analysis-run auto scheduler')
 }
 export const name = 'analysis-run'
 export const version = '0.2.0'
