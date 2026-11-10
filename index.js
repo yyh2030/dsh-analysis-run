@@ -335,7 +335,7 @@ export function apply(ctx, config = {}) {
             await copyFile(source,path.join(codeDir,name))
             if (hash(await readFile(path.join(codeDir,name))) !== hash(bytes)) throw new AnalysisError('code_changed', '代码快照期间文件变化，请重试')
           }
-          const request = { action: 'run', study: context.identity, plan, outputDir: cfg.outputDir, exclusions: await exclusions(cfg), revisionOf: payload.runId || null, scriptPaths: names.filter(name=>name!=='engine.py').map(name=>path.join(codeDir,name)) }
+          const request = { action: 'run', study: context.identity, plan, outputDir: cfg.outputDir, exclusions: await exclusions(cfg), revisionOf: payload.runId || null, scriptPaths: names.filter(name=>name!=='engine.py').map(name=>path.join(codeDir,name)), force: payload?.force === true || payload?.forceRecompute === true }
           if (dataset) request.dataset = dataset
           result = await python(cfg, path.join(codeDir, 'engine.py'), ['--request-json', JSON.stringify(request)])
         } finally { if (path.dirname(codeDir) !== os.tmpdir() || !path.basename(codeDir).startsWith('analysis-code-')) throw new AnalysisError('path', '临时代码路径校验失败'); await rm(codeDir,{recursive:true,force:true}) }
@@ -611,18 +611,34 @@ export function apply(ctx, config = {}) {
   let autoBusy = false
   let autoError = ''
   let autoTicks = 0
-  let autoPausedHash = null
+  let autoPausedKey = null
+  const autoDisposers = []
   function readInstanceId(dataRoot) {
     try { return JSON.parse(readFileSync(path.join(dataRoot, 'study-instance.json'), 'utf8')).instanceId || null } catch { return null }
   }
-  function scheduleDebounced(instanceId, hash = null) {
+  async function readAutoState() {
+    try { return JSON.parse(await readFile(path.join(current().cfg.outputDir, 'auto-state.json'), 'utf8')) } catch { return {} }
+  }
+  async function writeAutoState(value) {
+    try { await writeFile(path.join(current().cfg.outputDir, 'auto-state.json'), JSON.stringify(value, null, 2)) } catch { /* 状态文件只是加速，不阻断运行 */ }
+  }
+  // 自动运行的"输入指纹"= 数据 hash + 完整方案 + 研究身份；只改方案/排除也要触发一次。
+  function autoRequestedKey(plan, built) {
+    return hash(JSON.stringify({ study: current().context.identity?.id || null, plan, dataset: built.hash }))
+  }
+  function scheduleDebounced(instanceId, key = null) {
     if (autoDebounce) clearTimeout(autoDebounce)
     autoDebounce = setTimeout(() => {
       autoDebounce = null
-      run({}, current(), { instanceId }).then(() => { autoError = ''; autoPausedHash = null }).catch(error => {
+      run({}, current(), { instanceId }).then(async () => {
+        autoError = ''
+        autoPausedKey = null
+        const state = await readAutoState()
+        await writeAutoState({ ...state, requestedKey: key, completedAt: new Date().toISOString() })
+      }).catch(error => {
         autoError = String(error && error.message ? error.message : error)
-        // 同一份数据自动跑失败后不要每轮重试，等数据再变才继续。
-        autoPausedHash = hash
+        // 失败暂停键=完整输入指纹：修方案后指纹变化，自动恢复。
+        autoPausedKey = key
       })
     }, Number(config.debounceMs) || 3000)
     if (autoDebounce.unref) autoDebounce.unref()
@@ -643,13 +659,16 @@ export function apply(ctx, config = {}) {
       try {
         built = openAnalysis({ data: openResearchData({ study: context, instanceId }), study: context, owner: 'analysis-run' }).dataset({ plan })
       } catch { return }
+      const requestedKey = autoRequestedKey(plan, built)
+      const state = await readAutoState()
+      if (state.requestedKey === requestedKey) return
       const history = await runs(cfg)
-      // 已有排队的去抖就不重置：否则每轮轮询都会把等待时间往后推，永远等不到执行。
-      if (!history.length) { if (!autoDebounce && autoPausedHash !== built.hash) scheduleDebounced(instanceId, built.hash); return }
+      if (!history.length) { if (!autoDebounce && autoPausedKey !== requestedKey) scheduleDebounced(instanceId, requestedKey); return }
       const latest = await readJson(path.join(cfg.outputDir, 'runs', history[0].runId, 'meta.json'), null)
       const latestHash = latest?.dataset?.hash || latest?.source?.sha256
-      if (latestHash === built.hash) return
-      if (!autoDebounce && autoPausedHash !== built.hash) scheduleDebounced(instanceId, built.hash)
+      const samePlan = JSON.stringify(latest?.plan || null) === JSON.stringify(plan || null)
+      if (latestHash === built.hash && samePlan) return
+      if (!autoDebounce && autoPausedKey !== requestedKey) scheduleDebounced(instanceId, requestedKey)
     } finally {
       autoBusy = false
     }
@@ -658,7 +677,11 @@ export function apply(ctx, config = {}) {
     if (!config.autoRun || autoTimer) return
     autoTimer = setInterval(() => { autoTick().catch(() => {}) }, Number(config.autoPollMs) || 2000)
     if (autoTimer.unref) autoTimer.unref()
-    setTimeout(() => { autoTick().catch(() => {}) }, 50).unref?.()
+    autoDisposers.push(() => { clearInterval(autoTimer); autoTimer = null })
+    const initial = setTimeout(() => { autoTick().catch(() => {}) }, 50)
+    initial.unref?.()
+    autoDisposers.push(() => clearTimeout(initial))
+    autoDisposers.push(() => { if (autoDebounce) { clearTimeout(autoDebounce); autoDebounce = null } })
   }
   const attach = scope => scope.effect(() => scope.webServer.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route')
   const web = ctx.get?.('webServer'); if (web) ctx.effect(() => web.register({kind:'prefix',path:ROUTE,handler}), 'analysis-run route'); else ctx.inject(['webServer'],attach)
@@ -695,6 +718,7 @@ export function apply(ctx, config = {}) {
   }
   const tools = ctx.get?.('tools'); if (tools) register({tools}); else ctx.inject(['tools'],register)
   startAuto()
+  ctx.effect(() => () => { for (const dispose of autoDisposers.splice(0)) { try { dispose() } catch { /* 已清理 */ } } }, 'analysis-run auto scheduler')
 }
 export const name = 'analysis-run'
 export const version = '0.2.0'

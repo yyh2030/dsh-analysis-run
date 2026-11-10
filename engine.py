@@ -14,7 +14,7 @@ import sys
 import uuid
 import re as _re
 
-VERSION = 'analysis-engine/2.3.0'
+VERSION = 'analysis-engine/2.4.0'
 MODULES = ('descriptives', 'sample', 'sensitivity', 'correlation', 'reliability', 'ttest', 'anova', 'mediation', 'regression', 'paired', 'mixed', 'script')
 # 每个模块需要的本地依赖；缺后端时显示"环境待准备"，不能悄悄换成别的检验。
 BACKENDS = {'descriptives': ('numpy', 'pandas'), 'sample': ('numpy', 'pandas'), 'sensitivity': ('numpy', 'pandas'), 'correlation': ('numpy', 'pandas'), 'reliability': ('numpy', 'pandas'), 'ttest': ('numpy', 'pandas'), 'anova': ('numpy', 'pandas', 'statsmodels'), 'mediation': ('numpy', 'pandas', 'statsmodels'), 'script': ('numpy', 'pandas'), 'regression': ('numpy', 'pandas', 'statsmodels'),
@@ -1240,6 +1240,18 @@ def render(meta,tables):
     return '\n'.join(lines)
 
 
+def cache_artifacts_ok(entry, meta):
+    """缓存命中的前提是产物仍在：表文件与 input 快照缺失就不复用。"""
+    if not (entry / 'input.csv').is_file(): return False
+    for table in meta.get('tables', []) or []:
+        relative = table.get('path')
+        if not relative: continue
+        file = entry / relative
+        if not file.is_file(): return False
+        if table.get('sha256') and sha(file) != table['sha256']: return False
+    return True
+
+
 def find_cached_run(runs, fingerprint):
     """同输入 + 同方案 + 同代码 + 同环境的历史运行可直接复用，不重复计算。"""
     if not runs.is_dir():
@@ -1255,7 +1267,9 @@ def find_cached_run(runs, fingerprint):
         except Exception:
             continue
         if meta.get('fingerprint') == fingerprint and meta.get('status') in ('ok', 'partial'):
-            return meta
+            # 产物缺失/损坏的旧 run 不复用，也不改写它；本次直接新建 run。
+            if cache_artifacts_ok(entry, meta): return meta
+            continue
     return None
 
 
@@ -1269,13 +1283,25 @@ def run(request):
     exclusions=request.get('exclusions',[])
     env=environment()
     code_hashes={Path(__file__).name: sha(Path(__file__).resolve())}
+    script_code={}
+    script_plan=plan.get('script')
+    if isinstance(script_plan,dict) and script_plan.get('file'):
+        script_path=Path(str(script_plan['file']))
+        if not script_path.is_absolute(): raise ValueError('script.file must be absolute')
+        if not script_path.is_file(): raise ValueError('script.file not found')
+        text=script_path.read_text(encoding='utf-8')
+        script_plan={**script_plan,'code':text,'file':None,'sourceName':script_path.name}
+        plan['script']=script_plan
+        script_code[script_path.name]=text
+        code_hashes['script:'+script_path.name]=hashlib.sha256(text.encode()).hexdigest()
     for raw in request.get('scriptPaths',[]):
         path=Path(raw)
         if not path.is_file(): raise ValueError(f'code snapshot missing: {path.name}')
         if path.name in code_hashes: raise ValueError('code snapshot basename conflict')
         code_hashes[path.name]=sha(path)
     fingerprint=canonical({'source':sha(source),'plan':plan,'study':request['study'],'exclusions':exclusions,
-                           'code':code_hashes,'engine':VERSION,'environment':canonical(lock_signature(env)),
+                           'code':code_hashes,'script':{name:hashlib.sha256(text.encode()).hexdigest() for name,text in script_code.items()},
+                           'engine':VERSION,'environment':canonical(lock_signature(env)),
                            'dataset':(request.get('dataset') or {}).get('hash')})
     runs=root/'runs'; runs.mkdir(parents=True,exist_ok=True)
     # 环境锁先于缓存检查：锁漂移时必须失败，不能拿旧缓存顶替。
@@ -1289,7 +1315,7 @@ def run(request):
             raise ValueError('分析环境与锁不一致：'+'；'.join(problems)+'（确认后可用 environmentPolicy=record 重建锁）')
     elif policy=='record' or not lock_file.is_file():
         lock_state='created'
-    if not request.get('force'):
+    if not (request.get('force') or request.get('forceRecompute')):
         cached=find_cached_run(runs,fingerprint)
         if cached:
             if lock_state=='created':
@@ -1322,6 +1348,10 @@ def run(request):
             if not path.is_file(): raise ValueError(f'code snapshot missing: {path.name}')
             if path.name in copied_hashes: raise ValueError('code snapshot basename conflict')
             shutil.copyfile(path,code_dir/path.name); copied_hashes[path.name]=sha(code_dir/path.name)
+        for name,text in script_code.items():
+            target=code_dir/name
+            if target.name in copied_hashes: raise ValueError('code snapshot basename conflict')
+            target.write_text(text,encoding='utf-8'); copied_hashes['script:'+name]=hashlib.sha256(text.encode()).hexdigest()
         # 代码在快照期间被改过就重算 fingerprint，不复用旧缓存。
         if canonical(copied_hashes)!=canonical(code_hashes):
             code_hashes=copied_hashes
@@ -1350,7 +1380,7 @@ def run(request):
             frame=pd.DataFrame(rows)
             relative=f'tables/{key}.csv'; frame.to_csv(run_dir/relative,index=False,encoding='utf-8-sig')
             types={column: ('number' if any(isinstance(row.get(column),(int,float)) and not isinstance(row.get(column),bool) for row in rows) else 'string') for column in frame.columns}
-            tables.append({'key':key,'label':label,'columns':list(frame.columns),'rows':frame.astype(object).where(frame.notna(),None).values.tolist(),'path':relative,'types':types,'analysisSet':analysis_set})
+            tables.append({'key':key,'label':label,'columns':list(frame.columns),'rows':frame.astype(object).where(frame.notna(),None).values.tolist(),'path':relative,'sha256':sha(run_dir/relative),'types':types,'analysisSet':analysis_set})
         minimum=plan.get('gate',{}).get('minSubjects',30)
         functions={'descriptives':describe,'sample':sample_table,'sensitivity':sensitivity_table,'correlation':correlation,'reliability':reliability,'ttest':ttest,'anova':anova,'mediation':mediation,'script':run_script,'regression':regression,'paired':paired,'mixed':mixed}
         chosen=plan.get('analyses') or ['descriptives']
