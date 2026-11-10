@@ -11,6 +11,7 @@ import { hostBinding, bindingStatus } from '../research-core/host.mjs'
 import { openResearchData } from '../research-core/data.mjs'
 import { openAnalysis, AnalysisError as CoreAnalysisError } from '../research-core/analysis.mjs'
 import { buildResults, renderHtmlReport, tableFromGrid, artifactManifest } from '../research-core/results.mjs'
+import { agentProjection, resolvePrivacyPolicy, shareProjection, shareManifest, sanitizeError, scrubText } from '../research-core/privacy-projection.mjs'
 import { pointRangeChart, forestChart, distributionChart, pairedChart, renderPng, renderPdf } from '../research-core/charts.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -33,6 +34,106 @@ async function serialWrite(key, operation) {
 const hash = text => createHash('sha256').update(text).digest('hex')
 const readJson = async (file, fallback) => { try { return JSON.parse(await readFile(file, 'utf8')) } catch { return fallback } }
 class AnalysisError extends Error { constructor(code, message, details) { super(message); this.code = code; this.details = details } }
+
+/* ---------- 07：Agent 工具只拿得到摘要，拿不到逐人记录/路径 ---------- */
+const countNumber = (value) => {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : 0
+}
+
+/** analysis_status 的 Agent 摘要：状态、计数、显示名；路径与逐人排除明细不进入。 */
+function statusAgentSummary(data = {}) {
+  const runs = Array.isArray(data.runs) ? data.runs : []
+  const exclusions = Array.isArray(data.exclusions) ? data.exclusions : []
+  return {
+    status: data.busy ? 'busy' : (runs.length ? 'ready' : 'idle'),
+    study: { name: data.study ? data.study.name : null },
+    counts: { runs: runs.length, exclusions: exclusions.length, autoTicks: countNumber(data.autoTicks) },
+    runs: runs.slice(0, 20).map(run => ({
+      runId: run && run.runId ? String(run.runId) : null,
+      status: run && run.status ? String(run.status) : 'unknown',
+      interrupted: Boolean(run && run.interrupted),
+      n: run && run.n !== undefined ? countNumber(run.n) : null,
+      observations: run && run.observations !== undefined ? countNumber(run.observations) : null,
+    })),
+    pendingChanges: Boolean(data.pendingChanges),
+    backends: data.backends && typeof data.backends === 'object'
+      ? Object.fromEntries(Object.entries(data.backends).map(([name, value]) => [name, { ok: Boolean(value && value.ok), missing: Array.isArray(value && value.missing) ? value.missing.length : 0 }]))
+      : null,
+  }
+}
+
+/** analysis_results 的 Agent 摘要：表结构可以按列过滤，逐行数值只在 strict-local 外按白名单处理。 */
+function resultsAgentSummary(data = {}) {
+  const tables = (Array.isArray(data.tables) ? data.tables : []).map(table => {
+    if (!table || typeof table !== 'object') return table
+    // results() 里是 CSV 网格（columns 字符串、rows 数组）；投影需要按列 schema 得到对象行。
+    const isGrid = Array.isArray(table.rows) && (table.rows.length === 0 || Array.isArray(table.rows[0]))
+    return isGrid
+      ? tableFromGrid({ key: table.key, columns: table.columns || [], rows: table.rows || [], types: table.types || null, analysisSet: table.analysisSet || null, nodeId: table.nodeId || null, title: table.title || null, labels: table.labels })
+      : table
+  })
+  return {
+    runId: data.runId ? String(data.runId) : null,
+    status: data.meta && data.meta.status ? String(data.meta.status) : (data.runId ? 'unknown' : 'none'),
+    counts: {
+      tables: tables.length,
+      rows: tables.reduce((sum, table) => sum + (Array.isArray(table && table.rows) ? table.rows.length : 0), 0),
+      figures: Array.isArray(data.figures) ? data.figures.length : 0,
+      presentations: Array.isArray(data.presentations) ? data.presentations.length : 0,
+    },
+    tables: tables.map(table => ({
+      key: table.key,
+      number: table.number,
+      title: table.title,
+      columns: table.columns,
+      rows: table.rows,
+      types: table.types || null,
+      notes: table.notes || [],
+      analysisSet: table.analysisSet || null,
+      sourceHash: table.sourceHash || null,
+    })),
+    figureKeys: (Array.isArray(data.figures) ? data.figures : []).map(figure => figure && (figure.key || figure.name)).filter(Boolean),
+    analysisSet: data.meta && data.meta.analysisSet ? data.meta.analysisSet : data.analysisSet,
+    integrity: { ok: Boolean(data.integrity && data.integrity.ok), corrupt: Array.isArray(data.integrity && data.integrity.corrupt) ? data.integrity.corrupt.length : 0 },
+    study: data.study ? { name: data.study.name } : null,
+  }
+}
+
+/** analysis_export 的摘要：导出计数与相对产物名；本地目录不进入。 */
+function exportAgentSummary(data = {}) {
+  return {
+    runId: data.runId ? String(data.runId) : null,
+    revision: Number.isFinite(Number(data.revision)) ? Number(data.revision) : null,
+    status: 'exported',
+    counts: {
+      artifacts: Array.isArray(data.artifacts) ? data.artifacts.length : 0,
+      figures: Array.isArray(data.figures) ? data.figures.length : 0,
+      png: countNumber(data.png),
+    },
+    artifacts: (Array.isArray(data.artifacts) ? data.artifacts : []).map(relative => ({ relativePath: String(relative) })),
+    figures: (Array.isArray(data.figures) ? data.figures : []).map(key => String(key)),
+    pdf: data.pdf === true,
+    office: data.office === true,
+  }
+}
+
+/** analysis_run 的摘要：只留运行状态、计数与错误（错误由投影再脱敏）。 */
+function analysisRunSummary(data = {}) {
+  const meta = data && data.meta && typeof data.meta === 'object' ? data.meta : {}
+  return {
+    status: data.ok === false ? 'failed' : 'ok',
+    runId: data.runId ? String(data.runId) : null,
+    reused: data.reused === true,
+    counts: {
+      tables: Array.isArray(meta.tables) ? meta.tables.length : 0,
+      subjects: Number.isFinite(Number(meta.subjects)) ? Number(meta.subjects) : 0,
+      observations: Number.isFinite(Number(meta.observations)) ? Number(meta.observations) : 0,
+      warnings: Array.isArray(meta.warnings) ? meta.warnings.length : 0,
+    },
+    error: data.error ? String(data.error) : null,
+  }
+}
 
 export function parseCsv(text) {
   const result = []; let row = [], value = '', quoted = false
@@ -97,6 +198,17 @@ export function apply(ctx, config = {}) {
   let selected = configFor(config)
   let autoScheduler = null
   function current() { return selected }
+  /** 07：只从 privacy 服务/研究配置/插件配置读，Agent 工具参数不能放宽。 */
+  function privacyPolicy() {
+    const { cfg, context } = current()
+    return resolvePrivacyPolicy({ ctx, config: { ...config, ...cfg }, study: context, pluginKey: 'analysis' })
+  }
+  function currentPrivacyMode() {
+    try { return privacyPolicy().mode } catch { return 'strict-local' }
+  }
+  function privacyOptions(policy) {
+    return { sessionTools: policy.sessionTools, allowedColumns: policy.allowedColumns, maxBytes: policy.maxBytes, attachments: policy.attachments }
+  }
   const binding = hostBinding(ctx, {
     plugin: 'analysis-run',
     version: VERSION,
@@ -247,7 +359,7 @@ export function apply(ctx, config = {}) {
     for (const table of corrupt.length ? [] : allowed) {
       if (!/^tables\/[A-Za-z0-9_-]+\.csv$/.test(table.path)) continue
       const grid = parseCsv(await readFile(path.join(dir, table.path), 'utf8'))
-      tables.push({ key: table.key, label: table.label || table.key, columns: grid[0] || [], rows: grid.slice(1) })
+      tables.push({ key: table.key, label: table.label || table.key, columns: grid[0] || [], rows: grid.slice(1), types: table.types || null, analysisSet: table.analysisSet || null, nodeId: table.nodeId || null, title: table.title || null })
     }
     let report = null; if (valid.report && !corrupt.length) { try { report = await readFile(path.join(dir, 'report.md'), 'utf8') } catch {} }
     let figures = []
@@ -487,7 +599,8 @@ export function apply(ctx, config = {}) {
       respond(200,{ok:true,data:await action(actor, name, payload)})
     } catch(error) {
       const mapped = bindingStatus(error)
-      respond(mapped || (error.code==='not_found'?404:error.code==='forbidden'?403:400),{ok:false,error:{code:error.code||'error',message:error.message,details:error.details}})
+      // 07：错误响应去本地路径/逐人编号，details 与异常栈不返回。
+      respond(mapped || (error.code==='not_found'?404:error.code==='forbidden'?403:400),{ok:false,error:sanitizeError(error, { mode: currentPrivacyMode() })})
     }
   }
   /* ---------- 07 导出：结果对象 → 三线表 / 图 / HTML / PDF / manifest ---------- */
@@ -527,7 +640,7 @@ export function apply(ctx, config = {}) {
         subtitle: `分析集 ${descriptiveSet.subset} · 独立人数 ${descriptiveSet.subjects ?? '—'} · 观测 ${descriptiveSet.observations ?? '—'}`,
         height: 420,
         rows: descriptives.rows.map(row => ({
-          label: labelKeys.map(key => String(row[key] ?? '')).filter(Boolean).join(' × ') || '整体',
+          label: scrubText(labelKeys.map(key => String(row[key] ?? '')).filter(Boolean).join(' × ') || '整体'),
           estimate: row.mean, low: row.ciLow, high: row.ciHigh, n: row.subjects ?? row.n,
         })),
       })
@@ -538,40 +651,44 @@ export function apply(ctx, config = {}) {
     if (distribution && !distribution.error && Array.isArray(distribution.groups) && distribution.groups.length) {
       await addFigure('distribution', distributionChart({
         title: '分析集观测分布',
-        subtitle: `${distribution.outcome} · 分析集 n=${distribution.n} · 每个点=一个观测`,
-        groups: distribution.groups.slice(0, 6), height: 460,
+        subtitle: `${scrubText(distribution.outcome)} · 分析集 n=${distribution.n} · 每个点=一个观测`,
+        groups: distribution.groups.slice(0, 6).map(group => (group && typeof group === 'object' ? { ...group, label: scrubText(group.label) } : group)), height: 460,
       }), distribution.analysisSetId || descriptiveSet.id)
     }
     const coefficientTable = built.tables.find(table => table.key === 'coefficients') || built.tables.find(table => table.key === 'regression' && table.columns.some(column => column.key === 'term') && table.columns.some(column => column.key === 'estimate'))
     if (coefficientTable) {
-      await addFigure('model-estimates', forestChart({ title: '模型估计与 95% 区间', height: 360, rows: coefficientTable.rows.map(row => ({ label: String(row.term), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), coefficientTable.analysisSet?.id)
+      await addFigure('model-estimates', forestChart({ title: '模型估计与 95% 区间', height: 360, rows: coefficientTable.rows.map(row => ({ label: scrubText(String(row.term)), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), coefficientTable.analysisSet?.id)
     }
     const contrastTable = built.tables.find(table => table.key === 'contrasts') || built.tables.find(table => table.key === 'contrast')
     if (contrastTable && contrastTable.columns.some(column => column.key === 'estimate')) {
-      await addFigure('planned-contrasts', forestChart({ title: '预设对比', height: 340, rows: contrastTable.rows.map(row => ({ label: String(row.name ?? row.term ?? '对比'), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), contrastTable.analysisSet?.id)
+      await addFigure('planned-contrasts', forestChart({ title: '预设对比', height: 340, rows: contrastTable.rows.map(row => ({ label: scrubText(String(row.name ?? row.term ?? '对比')), estimate: row.estimate, low: row.ciLow, high: row.ciHigh, p: row.p })) }), contrastTable.analysisSet?.id)
     }
     const pairedChartData = data.meta?.charts?.paired
     if (pairedChartData && !pairedChartData.error && Array.isArray(pairedChartData.pairs) && pairedChartData.pairs.length) {
       const plan = data.meta?.plan || {}
-      const beforeLabel = plan.pairedColumns?.[0] || plan.within?.levels?.[0] || '前测'
-      const afterLabel = plan.pairedColumns?.[1] || plan.within?.levels?.[1] || '后测'
+      const beforeLabel = scrubText(plan.pairedColumns?.[0] || plan.within?.levels?.[0] || '前测')
+      const afterLabel = scrubText(plan.pairedColumns?.[1] || plan.within?.levels?.[1] || '后测')
       await addFigure('paired-trajectories', pairedChart({
         title: '配对变化轨迹',
         subtitle: `${beforeLabel} → ${afterLabel} · 分析集 n=${pairedChartData.n} · 每位参与者一条线`,
         pairs: pairedChartData.pairs, beforeLabel, afterLabel, height: 460,
       }), pairedChartData.analysisSetId)
     }
-    const figureHtml = built.figures.map((figure, index) => {
+    // 07：分享包从白名单重新构造；HTML/JSON/Office 的标题与表值共用同一份分享视图。
+    const policy = privacyPolicy()
+    const share = shareProjection(built, { meta: data.meta, mode: policy.mode })
+    const figureHtml = share.figures.map((figure, index) => {
+      if (!figure.svg) return ''
       // 内联进 HTML 时去掉 SVG 命名空间（HTML5 不需要，也让报告里没有任何 http 引用）。
       const svg = readFileSync(path.join(outDir, figure.svg), 'utf8').replace(/\sxmlns="http:\/\/www\.w3\.org\/2000\/svg"/, '')
       const png = figures.find(item => item.key === figure.key)
       return `<figure class="chart" data-figure="${escapeAttr(figure.key)}">${svg}<figcaption>图 ${index + 1} ${escapeAttr(figure.title || figure.key)}${png ? ` · PNG 300dpi：${escapeAttr(png.png)}` : ''}</figcaption></figure>`
     }).join('\n')
-    const html = renderHtmlReport({ meta: data.meta, results: built, today: new Date().toISOString().slice(0, 10) })
+    const html = renderHtmlReport({ meta: share.meta, results: share, today: new Date().toISOString().slice(0, 10) })
       .replace('<h2>表格 <span class="meta">Tables</span></h2>', `${figureHtml}<h2>表格 <span class="meta">Tables</span></h2>`)
     await writeFile(path.join(outDir, 'report.html'), html)
     const pdf = renderPdf({ html, outPath: path.join(outDir, 'report.pdf') })
-    await writeFile(path.join(outDir, 'results.json'), JSON.stringify({ ...built, figures: built.figures.map(figure => ({ ...figure, svg: undefined, png: figures.find(item => item.key === figure.key)?.png || null })) }, null, 2))
+    await writeFile(path.join(outDir, 'results.json'), JSON.stringify({ ...share, figures: share.figures.map(figure => ({ ...figure, svg: undefined, png: figures.find(item => item.key === figure.key)?.png || null })) }, null, 2))
     // 三线表的 DOCX / XLSX：本地 python-docx / openpyxl 渲染，失败也要写进结果而不是静默跳过。
     let office = { ok: false, reason: '未运行' }
     if (cfg.pythonPath) {
@@ -584,7 +701,7 @@ export function apply(ctx, config = {}) {
       artifacts.push({ mediaType, relativePath: relative, sha256: hash(content) })
     }
     await addFile('report.html', 'text/html')
-    for (const figure of built.figures) await addFile(figure.svg, 'image/svg+xml')
+    for (const figure of share.figures) if (figure.svg) await addFile(figure.svg, 'image/svg+xml')
     for (const figure of figures) await addFile(figure.png, 'image/png')
     await addFile('results.json', 'application/json')
     if (office.ok) {
@@ -592,19 +709,19 @@ export function apply(ctx, config = {}) {
       await addFile('tables.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     }
     if (pdf.ok) await addFile('report.pdf', 'application/pdf')
-    const manifest = artifactManifest({ results: built, artifacts })
+    const manifest = shareManifest(artifactManifest({ results: share, artifacts }))
     manifest.presentationRevision = revision
     manifest.parent = previous ? `presentation/${previous}/manifest.json` : null
     manifest.pdf = pdf.ok ? { relativePath: 'report.pdf' } : { unavailable: pdf.reason }
     manifest.office = office.ok ? { docx: 'tables.docx', xlsx: 'tables.xlsx' } : { unavailable: office.reason }
     // 排版 revision 的可追溯信息：格式 schema、分析集引用、图表分析集与来源模型 hash。
     manifest.formatSchema = 1
-    manifest.analysisSet = built.analysisSet
-    manifest.figures = built.figures.map(figure => ({ key: figure.key, analysisSetId: figure.analysisSetId || null }))
-    manifest.render = { html: 'ok', pdf: pdf.ok ? 'ok' : { unavailable: pdf.reason }, office: office.ok ? 'ok' : { unavailable: office.reason }, svg: built.figures.length, png: figures.length }
+    manifest.analysisSet = share.analysisSet
+    manifest.figures = share.figures.map(figure => ({ key: figure.key, analysisSetId: figure.analysisSetId || null }))
+    manifest.render = { html: 'ok', pdf: pdf.ok ? 'ok' : { unavailable: pdf.reason }, office: office.ok ? 'ok' : { unavailable: office.reason }, svg: share.figures.length, png: figures.length }
     try { manifest.sourceModelHash = hash(await readFile(path.join(runDir, 'model.json'))) } catch { manifest.sourceModelHash = null }
     await writeFile(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
-    return { runId, revision, dir: `runs/${runId}/presentation/${revision}`, artifacts: artifacts.map(item => item.relativePath), figures: built.figures.map(figure => figure.key), png: figures.length, pdf: pdf.ok, office: office.ok, manifest, study: context.identity }
+    return { runId, revision, dir: `runs/${runId}/presentation/${revision}`, artifacts: artifacts.map(item => item.relativePath), figures: share.figures.map(figure => figure.key), png: figures.length, pdf: pdf.ok, office: office.ok, manifest, study: context.identity }
   }
   const escapeAttr = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]))
 
@@ -643,23 +760,44 @@ export function apply(ctx, config = {}) {
     const output = { schema:{type:'object',properties:{text:{type:'string'}},required:['text'],additionalProperties:false},render:(_a,v)=>[{type:'text',text:v.text}] }
     const defs = [
       ['analysis_status','查看当前研究、分析方案、输入状态与运行历史。',{},[],async (args,exec)=>{
-        const { data } = await binding.read(binding.agentActor(exec), async view => status({}, view))
-        return JSON.stringify({ ...data, binding: undefined }, null, 2)
+        try {
+          const { data } = await binding.read(binding.agentActor(exec), async view => status({}, view))
+          const policy = privacyPolicy()
+          return JSON.stringify(agentProjection('analysis_status', statusAgentSummary(data), policy.mode, privacyOptions(policy)), null, 2)
+        } catch (error) {
+          return JSON.stringify(sanitizeError(error, { mode: currentPrivacyMode() }), null, 2)
+        }
       }],
       ['analysis_run','运行通用分析或显式配置的本地适配器，每次通用运行保存独立快照。',{stage:{type:'string'},runId:{type:'string'}},[],async (args,exec)=>{
-        const actor = binding.agentActor(exec)
-        const { binding: view, data } = await binding.write(actor, {}, async (_v, state) => requestRun(args || {}, state, _v), { holdLock: false, capture: () => current() })
-        return JSON.stringify({ ...data, binding: view }, null, 2)
+        try {
+          const actor = binding.agentActor(exec)
+          const { binding: view, data } = await binding.write(actor, {}, async (_v, state) => requestRun(args || {}, state, _v), { holdLock: false, capture: () => current() })
+          void view
+          const policy = privacyPolicy()
+          return JSON.stringify(agentProjection('analysis_run', analysisRunSummary(data), policy.mode, privacyOptions(policy)), null, 2)
+        } catch (error) {
+          return JSON.stringify(sanitizeError(error, { mode: currentPrivacyMode() }), null, 2)
+        }
       }],
       ['analysis_results','读取指定运行的动态表格、节点状态与报告。',{runId:{type:'string'},table:{type:'string'}},[],async (args,exec)=>{
-        const actor = binding.agentActor(exec)
-        const { data } = await binding.read(actor, async () => { const value = await results(args || {}); if (args && args.table) value.tables = value.tables.filter(row => row.key === args.table); return value })
-        return JSON.stringify(data, null, 2)
+        try {
+          const actor = binding.agentActor(exec)
+          const { data } = await binding.read(actor, async () => { const value = await results(args || {}); if (args && args.table) value.tables = value.tables.filter(row => row.key === args.table); return value })
+          const policy = privacyPolicy()
+          return JSON.stringify(agentProjection('analysis_results', resultsAgentSummary(data), policy.mode, privacyOptions(policy)), null, 2)
+        } catch (error) {
+          return JSON.stringify(sanitizeError(error, { mode: currentPrivacyMode() }), null, 2)
+        }
       }],
       ['analysis_export','把指定运行导出为自包含 HTML/PDF/三线表图片与产物清单（本地渲染，不调云端）。',{runId:{type:'string'}},[],async (args,exec)=>{
-        const actor = binding.agentActor(exec)
-        const { data } = await binding.write(actor, {}, async (_v) => exportRun(args || {}), { holdLock: false, capture: () => current() })
-        return JSON.stringify({ ...data, binding: undefined }, null, 2)
+        try {
+          const actor = binding.agentActor(exec)
+          const { data } = await binding.write(actor, {}, async (_v) => exportRun(args || {}), { holdLock: false, capture: () => current() })
+          const policy = privacyPolicy()
+          return JSON.stringify(agentProjection('analysis_export', exportAgentSummary(data), policy.mode, privacyOptions(policy)), null, 2)
+        } catch (error) {
+          return JSON.stringify(sanitizeError(error, { mode: currentPrivacyMode() }), null, 2)
+        }
       }],
       ['analysis_exclude','按研究编号维护人工排除；新运行应用变更，历史快照不变。',{id:{type:'string'},op:{type:'string',enum:['add','remove']},reason:{type:'string'}},['id','op'],async (args,exec)=>{
         const actor = binding.agentActor(exec)
