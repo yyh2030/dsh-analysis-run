@@ -174,3 +174,13 @@ The analysis section of the study definition:
 ## License
 
 MIT, see `LICENSE` in the repository root (Copyright © 2026 Yuhui YANG). The license covers plugin code only, not research data: participant information, questionnaire responses, study definitions and data derived from them remain the property of the research party and are not licensed under it. The bundled scipy / statsmodels / numpy / pandas are BSD-licensed; redistributing them with the plugin only requires keeping the LICENSE inside each wheel.
+
+## Support matrix and statistics backend (09)
+
+- Verified: Windows x64 + DSH runtime CPython 3.12 (wheel tags cp312 / win_amd64).
+- Not verified: macOS / Linux, Python 3.13, ARM.
+- Explicit preparation (never auto-run on install):
+  1. `node vendor/install.mjs`
+  2. `node vendor/install.mjs --check` — 0=ready; 2/3/4/5=interpreter/ABI/install/self-check failure
+- Wheels install into the plugin-private `vendor/site-packages`; numpy/pandas still come from the DSH runtime.
+- Other interpreter/platform: add matching wheels and re-run install.mjs; without wheels the UI shows environment

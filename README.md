@@ -174,3 +174,15 @@ node vendor/install.mjs --check   # 只看当前解释器与已装版本
 ## 许可
 
 MIT，见仓库根目录 `LICENSE`（Copyright © 2026 Yuhui YANG）。许可只覆盖插件代码，不覆盖研究数据：被试信息、问卷作答、研究定义与由它们派生的数据仍归研究方所有，不随本许可授权。自带的 scipy / statsmodels / numpy / pandas 为 BSD 许可，随插件再分发时保留各 wheel 内的 LICENSE 即可。
+
+## 支持矩阵与统计后端准备（09）
+
+- 已验证：Windows x64 + DSH 运行时 CPython 3.12（wheel 标签 cp312 / win_amd64）。
+- 未验证：macOS / Linux、Python 3.13、ARM。
+- 显式准备（不随插件安装自动执行）：
+  1. 
+ode vendor/install.mjs
+  2. 
+ode vendor/install.mjs --check —— 0=生效；2/3/4/5=解释器/ABI/安装/自检失败
+- wheel 装到插件私有 endor/site-packages；numpy/pandas 仍由 DSH 运行时提供。
+- 换解释器或平台：放入对应 wheel 后重跑 install.mjs；没有 wheel 时显示环境待准备，不伪装支持。
