@@ -41,5 +41,8 @@
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
+  },
+  "dependencies": {
+    "@local/research-core": "file:../research-core"
   }
 }

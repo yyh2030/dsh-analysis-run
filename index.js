@@ -7,12 +7,12 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadStudyContext, validateStudyDefinition } from './study-context.mjs'
 import { createScheduler } from './scheduler.mjs'
-import { hostBinding, bindingStatus } from '../research-core/host.mjs'
-import { openResearchData } from '../research-core/data.mjs'
-import { openAnalysis, AnalysisError as CoreAnalysisError } from '../research-core/analysis.mjs'
-import { buildResults, renderHtmlReport, tableFromGrid, artifactManifest } from '../research-core/results.mjs'
-import { agentProjection, resolvePrivacyPolicy, shareProjection, shareManifest, sanitizeError, scrubText } from '../research-core/privacy-projection.mjs'
-import { pointRangeChart, forestChart, distributionChart, pairedChart, renderPng, renderPdf } from '../research-core/charts.mjs'
+import { hostBinding, bindingStatus } from '@local/research-core/host'
+import { openResearchData } from '@local/research-core/data'
+import { openAnalysis, AnalysisError as CoreAnalysisError } from '@local/research-core/analysis'
+import { buildResults, renderHtmlReport, tableFromGrid, artifactManifest } from '@local/research-core/results'
+import { agentProjection, resolvePrivacyPolicy, shareProjection, shareManifest, sanitizeError, scrubText } from '@local/research-core/privacy-projection'
+import { pointRangeChart, forestChart, distributionChart, pairedChart, renderPng, renderPdf } from '@local/research-core/charts'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LOADED_HASHES = Object.fromEntries(['index.js','study-context.mjs','study-selection.mjs'].map(name => [name, createHash('sha256').update(readFileSync(path.join(HERE,name))).digest('hex')]))
@@ -813,4 +813,4 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => { autoScheduler.dispose() }, 'analysis-run auto scheduler')
 }
 export const name = 'analysis-run'
-export const version = '0.2.0'
+export const version = '0.5.0'
