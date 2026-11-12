@@ -197,7 +197,12 @@ export function apply(ctx, config = {}) {
   const VERSION = '0.5.0'
   let selected = configFor(config)
   let autoScheduler = null
-  function current() { return selected }
+  let legacyChecked = false
+  function current() {
+    // 页面/显式路径都没有时，其它插件统一回退到旧配置研究（study-ops 注册的 legacy）。
+    if (!legacyChecked && !selected.context.configured) { legacyChecked = tryLegacyFallback() }
+    return selected
+  }
   /** 07：只从 privacy 服务/研究配置/插件配置读，Agent 工具参数不能放宽。 */
   function privacyPolicy() {
     const { cfg, context } = current()
@@ -215,7 +220,7 @@ export function apply(ctx, config = {}) {
     config,
     hooks: {
       loadStudy: studyPath => configFor({ studyPath, ...(config.pythonPath ? { pythonPath: config.pythonPath } : {}) }).context,
-      currentIdentity: () => ({ studyId: selected.context.id, studyPath: selected.context.path, dataRoot: selected.context.dataRoot, revision: selected.context.revision }),
+      currentIdentity: () => { const { context } = current(); return { studyId: context.id, studyPath: context.path, dataRoot: context.dataRoot, revision: context.revision } },
       busy: () => LOCKS.size > 0 || WRITES.size > 0,
       prepareSwitch(studyPath) {
         if (LOCKS.has(selected.cfg.outputDir) || WRITES.has(selected.cfg.outputDir) || LOCKS.size > 0) throw new AnalysisError('busy', '分析正在运行或保存，暂不能切换研究')
@@ -226,6 +231,14 @@ export function apply(ctx, config = {}) {
     }
   })
   binding.dispatch(ctx)
+  function tryLegacyFallback() {
+    try {
+      const legacy = binding.legacyStudy() 
+      if (!legacy || !legacy.studyPath) return false
+      selected = configFor({ ...config, studyPath: legacy.studyPath })
+      return Boolean(selected.context.configured)
+    } catch { return false }
+  }
   async function studyConnect(actor, payload) {
     if (!path.isAbsolute(String(payload.studyPath || ''))) throw new AnalysisError('invalid', '研究定义需要绝对路径')
     const view = binding.connect(actor, { studyPath: payload.studyPath })
