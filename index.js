@@ -194,7 +194,7 @@ function configFor(config) {
 }
 
 export function apply(ctx, config = {}) {
-  const VERSION = '0.2.0'
+  const VERSION = '0.5.0'
   let selected = configFor(config)
   let autoScheduler = null
   function current() { return selected }
