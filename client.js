@@ -471,7 +471,7 @@ window.__ModuleLoader__.load({
     async function call(action, payload, run) {
       const ticket = await requestTicket()
       const init = { headers: { 'x-analysis-run': '1', ...ticket.headers } }
-      if (payload !== undefined) { init.method = 'POST'; init.headers['content-type'] = 'application/json'; init.body = JSON.stringify({ action, payload: { ...payload, ...ticket.body, binding: ticket.token } }) }
+      if (payload !== undefined) { init.method = 'POST'; init.headers['content-type'] = 'application/json'; init.body = JSON.stringify({ action, payload: { ...payload, ...ticket.body } }) }
       const response = await fetch(`${API}?action=${action}${run ? '&run=' + encodeURIComponent(run) : ''}`, init)
       const result = await response.json()
       if (!result.ok) { const error = new Error(result.error?.message || '请求失败'); error.details = result.error?.details; error.code = result.error?.code; throw error }
