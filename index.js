@@ -194,7 +194,7 @@ function configFor(config) {
 }
 
 export function apply(ctx, config = {}) {
-  const VERSION = '0.5.1'
+  const VERSION = '0.5.2'
   let selected = configFor(config)
   let autoScheduler = null
   let legacyChecked = false
@@ -504,7 +504,7 @@ export function apply(ctx, config = {}) {
     return { id, pendingChanges: true }
   }
   const queries = { schema, status, results, preview: planPreview }
-  const READ_ACTIONS = new Set(['schema', 'status', 'results', 'preview'])
+  const READ_ACTIONS = new Set(['schema', 'status', 'results', 'preview', 'studyChoices'])
 
   /** 方案向导的预览：返回列名与各模块可用人数，不写任何文件。 */
   async function planPreview(payload = {}) {
@@ -538,7 +538,19 @@ export function apply(ctx, config = {}) {
       return { ...binding.capabilities(actor), study: current().context.identity }
     }
     if (name === 'autoTick') { await autoScheduler.tick(); return { ticked: true } }
+    if (name === 'studyChoices') return binding.studyChoices(actor)
+    if (name === 'studyDiscover') return binding.discoverStudy(payload.dir)
+    if (name === 'studyRelocate') {
+      const view = binding.relocateStudy(actor, payload)
+      const active = await binding.activate(actor)
+      return { study: current().context.identity, binding: active, connected: view, relocated: view.relocated }
+    }
     if (name === 'studyConnect') return await studyConnect(actor, payload)
+    if (name === 'studyCreate') {
+      const view = binding.connect(actor, { ...payload, create: true })
+      const active = await binding.activate(actor)
+      return { study: current().context.identity, binding: active, connected: view, relocated: view.relocated }
+    }
     if (name === 'studySave') return await studySave(actor, payload)
     if (!Object.hasOwn(queries, name) && !['plan', 'run', 'exclude', 'export'].includes(name)) throw new AnalysisError('action', '未知操作')
     const expected = { token: payload.binding || payload.bindingToken, studyId: payload.studyId, studyRevision: payload.studyRevision }
@@ -828,4 +840,4 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => { autoScheduler.dispose() }, 'analysis-run auto scheduler')
 }
 export const name = 'analysis-run'
-export const version = '0.5.1'
+export const version = '0.5.2'
