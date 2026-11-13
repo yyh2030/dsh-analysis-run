@@ -196,3 +196,39 @@ ode --check + 全套 168/168。
   不再把所有写入失败都显示成研究已变化；记录 staleKind。
 - analysis-run：内部 VERSION 常量为 0.2.0 已同步为 0.5.0（与 package/export 一致）。
 - 验证：node --check 通过；绑定/路由测试此前 8/8。
+## 2026-11-12 · 09 V01 发现分组卡片与核心投影不一致
+
+- 运行台分组卡合计 89，核心 flow_projection 已入组 63、分组合计 63；来源/分母不一致，列 P1 待修。
+- 另记录：102? 实际 100 参与者 = 63 入组 + 37 登记未入组；性别 10/43/0/10/0。
+## 2026-11-12 · 09 修复分组卡分母
+
+- 运行台分组进度在 core 视图下改用已提交代次的 enrolled 分组与性别，不再混用旧文件分母（89 → 63）。
+- study-ops client 修复；node --check 通过；需重启确认。
+## 2026-11-12 · 09 V01 合成长表导出与分享泄漏修复
+
+- 120 人合成分析经真实路由导出：correlation 105 行；DOCX 106 行、XLSX 110 行；PDF 6 页。
+- 修复分享包泄漏：privacy 过滤 subjectIds 等逐人集合；新增 P02-C 回归测试（11/11 隐私测试通过）。
+- 证据：reports/.../09-V01-证据/合成-长表导出/。
+## 2026-11-12 · 09 启动一致性回退与测试存储隔离
+
+- 新增 core.legacyStudy()（host 暴露）：无页面/显式路径时，analysis-run/scale-desk/demographic-coder
+  回退到 study-ops 注册的 legacy 研究，不再各自落到 study-<空根hash>。
+- readCapabilities 自愈：能力查询把各插件 prepareSwitch 到当前页面/会话绑定，未打开过的面板不再误报不一致；busy 时保持原状并如实报告。
+- 测试隔离：harness.mjs 默认给每个测试进程 mkdtemp 的 DSH_RESEARCH_STORE，防止测试把临时研究写进用户 store。
+- 清理历史测试污染：instances 193→2、bindings 17→13（备份 *.bak-20261112）。
+- 测试：新增 remediation-09-fallback 2 例；全量 214 tests / 213 pass / 0 fail / 1 skipped。
+## 2026-11-13 · 09 重启后最终验证
+
+- 四插件一致绑定 local-private-research；运行台入组 63、分组 12/15/18/18 合计 63，无绑定过期横幅。
+- 证据：reports/.../09-V01-证据/运行台-重启后.png；全量 214/213/0/1。
+## 2026-11-13 · followup 01 继续修复（A1—A7）
+
+- core 1.5.0：connect(create:true) 真正创建、已有冲突不覆盖；restore 同根有已提交数据时
+  unsupported_restore_target；analysis 依据当前裁决校验分数（撤销=adjudication_revoked，
+  改选未重算=score_pending）；flow 裁决版本单调递增。
+- analysis-run 0.5.1 / engine 2.5.0：排除内容进入自动运行指纹；缓存要求完整 artifactHashes
+  并拒绝缺 hash/篡改/越界；list 分支表格补 analysisSet；engine 直调自加载 vendor 统计后端。
+- scale-desk 0.3.1：发布分数冻结 observationId/adjudicationVersion/taskId/visitId。
+- 测试：followup-01 6 例、FIX-02 scheduler 1 例、analysis-auto 真实排除补跑、FIX-07 迁移用例；
+  全量 222 tests / 221 pass / 0 fail / 1 skipped；scale 28/28。
+- 限制：裁决后需手动重新计分；legacy scores 未标记 unverified；创建入口仅 study-ops（02 统一）。

@@ -6,8 +6,8 @@ const sha256 = value => createHash('sha256').update(value).digest('hex')
  * 自动运行的输入指纹：研究身份 + 完整方案 + 数据集 hash。
  * 字段顺序固定（studyId、plan、datasetHash），修改方案或数据都必须产生新键。
  */
-export function requestedKey({ studyId = null, plan = null, datasetHash = null } = {}) {
-  return sha256(JSON.stringify({ studyId, plan, datasetHash }))
+export function requestedKey({ studyId = null, plan = null, datasetHash = null, exclusionsHash = null } = {}) {
+  return sha256(JSON.stringify({ studyId, plan, datasetHash, exclusionsHash }))
 }
 
 /**
@@ -123,8 +123,13 @@ export function createScheduler({
         built = await analysis.dataset({ state: studyState, plan, instanceId })
       } catch { return state() }
       const datasetHash = built && built.hash ? built.hash : null
+      // 只改人工排除名单也必须触发一次自动更新：把排除内容纳入同一输入指纹。
+      // 未注入 exclusions 的调用方（旧测试/嵌入）保持原指纹，不偷偷改变既有键。
+      const hasExclusions = typeof analysis.exclusions === 'function'
+      const exclusions = hasExclusions ? await analysis.exclusions(cfg) : null
+      const exclusionsHash = hasExclusions ? sha256(JSON.stringify(exclusions || [])) : null
 
-      const key = requestedKey({ studyId: context.identity?.id ?? context.id ?? null, plan, datasetHash })
+      const key = requestedKey({ studyId: context.identity?.id ?? context.id ?? null, plan, datasetHash, ...(exclusionsHash ? { exclusionsHash } : {}) })
       lastKey = key
 
       const stored = await readAutoState(cfg)
@@ -141,7 +146,8 @@ export function createScheduler({
         : null
       const latestHash = latest?.dataset?.hash || latest?.source?.sha256
       const samePlan = JSON.stringify(latest?.plan || null) === JSON.stringify(plan || null)
-      if (latestHash === datasetHash && samePlan) return state()
+      const sameExclusions = !hasExclusions || JSON.stringify((latest && latest.exclusions) || []) === JSON.stringify(exclusions || [])
+      if (latestHash === datasetHash && samePlan && sameExclusions) return state()
 
       if (debounce === null && pausedKey !== key) schedule(studyState, key, instanceId)
       return state()

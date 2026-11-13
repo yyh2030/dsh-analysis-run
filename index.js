@@ -194,7 +194,7 @@ function configFor(config) {
 }
 
 export function apply(ctx, config = {}) {
-  const VERSION = '0.5.0'
+  const VERSION = '0.5.1'
   let selected = configFor(config)
   let autoScheduler = null
   let legacyChecked = false
@@ -760,6 +760,8 @@ export function apply(ctx, config = {}) {
       latestMeta: (cfg, runId) => readJson(path.join(cfg.outputDir, 'runs', runId, 'meta.json'), null),
       dataset: ({ state: studyState, plan, instanceId }) => openAnalysis({ data: openResearchData({ study: studyState.context, instanceId }), study: studyState.context, owner: 'analysis-run' }).dataset({ plan }),
       instanceId: context => readInstanceId(context.dataRoot),
+      // 排除名单也影响结果：调度输入指纹与 latest run 比较都要读它。
+      exclusions: cfg => exclusions(cfg),
       // 对内存 LOCKS/WRITES 的检查作为 run 前 guard。
       blocked: studyState => LOCKS.has(studyState.cfg.outputDir) || WRITES.has(studyState.cfg.outputDir),
     },
@@ -826,4 +828,4 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => { autoScheduler.dispose() }, 'analysis-run auto scheduler')
 }
 export const name = 'analysis-run'
-export const version = '0.5.0'
+export const version = '0.5.1'

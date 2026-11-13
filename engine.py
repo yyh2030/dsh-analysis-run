@@ -14,7 +14,13 @@ import sys
 import uuid
 import re as _re
 
-VERSION = 'analysis-engine/2.4.0'
+# 测试、预览和生产必须使用同一统计后端：直接调用 engine.py 时也把插件自带的
+# vendor/site-packages 前置到 sys.path（插件运行时会通过 PYTHONPATH 再做一次）。
+_VENDOR_SITE = Path(__file__).resolve().parent / 'vendor' / 'site-packages'
+if _VENDOR_SITE.is_dir() and str(_VENDOR_SITE) not in sys.path:
+    sys.path.insert(0, str(_VENDOR_SITE))
+
+VERSION = 'analysis-engine/2.5.0'
 MODULES = ('descriptives', 'sample', 'sensitivity', 'correlation', 'reliability', 'ttest', 'anova', 'mediation', 'regression', 'paired', 'mixed', 'script')
 # 每个模块需要的本地依赖；缺后端时显示"环境待准备"，不能悄悄换成别的检验。
 BACKENDS = {'descriptives': ('numpy', 'pandas'), 'sample': ('numpy', 'pandas'), 'sensitivity': ('numpy', 'pandas'), 'correlation': ('numpy', 'pandas'), 'reliability': ('numpy', 'pandas'), 'ttest': ('numpy', 'pandas'), 'anova': ('numpy', 'pandas', 'statsmodels'), 'mediation': ('numpy', 'pandas', 'statsmodels'), 'script': ('numpy', 'pandas'), 'regression': ('numpy', 'pandas', 'statsmodels'),
@@ -1240,15 +1246,36 @@ def render(meta,tables):
     return '\n'.join(lines)
 
 
+CACHE_REQUIRED_ARTIFACTS = ('input.csv', 'plan.json', 'study.json', 'exclusions.json', 'environment.json', 'model.json', 'report.md')
+
+
 def cache_artifacts_ok(entry, meta):
-    """缓存命中的前提是产物仍在：表文件与 input 快照缺失就不复用。"""
+    """完整缓存校验：必需文件齐全、artifactHashes 全部命中且没越出 runDir。
+
+    旧 run 没有 artifactHashes 时不再当作可信缓存（转新 run），避免只凭 meta 状态复用
+    一个输入/模型/报告可能已损坏的历史运行。
+    """
+    hashes = meta.get('artifactHashes')
+    if not isinstance(hashes, dict) or not hashes: return False
     if not (entry / 'input.csv').is_file(): return False
+    if sha(entry / 'input.csv') != str(meta.get('source', {}).get('sha256') or ''): return False
+    root = entry.resolve()
+    for relative, expected in hashes.items():
+        target = entry / relative
+        try:
+            resolved = target.resolve()
+        except Exception:
+            return False
+        if resolved != root and root not in resolved.parents: return False  # 路径穿越/越界 symlink
+        if not target.is_file(): return False
+        if sha(target) != str(expected): return False
+    for name in CACHE_REQUIRED_ARTIFACTS:
+        if name not in hashes: return False
     for table in meta.get('tables', []) or []:
         relative = table.get('path')
         if not relative: continue
-        file = entry / relative
-        if not file.is_file(): return False
-        if table.get('sha256') and sha(file) != table['sha256']: return False
+        if relative not in hashes: return False
+        if table.get('sha256') and hashes.get(relative) != table['sha256']: return False
     return True
 
 
@@ -1422,7 +1449,7 @@ def run(request):
                         put(table['key'], table.get('label') or table['key'], table['rows'],aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'tables':len(value['tables']),'stdout':str(value.get('stdout') or '')[:400]}}
                 elif isinstance(value,list):
-                    put(module,module,value)
+                    put(module,module,value,aset)
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':{'rows':len(value)}}
                 else:
                     meta['nodes'][module]={'status':'executed','dependsOn':['prepare'],'reason':'','result':value}
