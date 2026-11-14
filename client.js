@@ -708,8 +708,8 @@ function createStudyPicker(options) {
     if (panel) { close(); return }
     panel = el('div', {
       style: {
-        position: 'fixed', top: '70px', right: '24px', width: '540px', maxWidth: 'calc(100vw - 48px)',
-        maxHeight: 'calc(100vh - 120px)', overflow: 'auto', zIndex: '2147483000', background: '#fbfaf6',
+        position: 'fixed', bottom: '108px', right: '24px', width: '540px', maxWidth: 'calc(100vw - 48px)',
+        maxHeight: 'calc(100vh - 200px)', overflow: 'auto', zIndex: '2147483000', background: '#fbfaf6',
         border: '1px solid #cdc7b7', borderRadius: '10px', padding: '14px', boxShadow: '0 18px 50px rgba(0,0,0,.22)',
         fontFamily: 'Cambria, "Noto Serif SC", serif', color: '#24221f', fontSize: '14px',
       },
@@ -720,10 +720,11 @@ function createStudyPicker(options) {
 
   function install() {
     if (root) return root
+    if (typeof window !== 'undefined' && window.__DSH_RESEARCH_PICKER_INSTANCE__) return window.__DSH_RESEARCH_PICKER_INSTANCE__
     if (!document.body || typeof document.body.appendChild !== 'function' || !document.createElement) return null
     root = el('button', {
       style: {
-        position: 'fixed', top: '18px', right: '26px', zIndex: '2147482000',
+        position: 'fixed', bottom: '64px', right: '24px', zIndex: '2147482000',
         height: '30px', padding: '0 12px', border: '1px solid #cdc7b7', borderRadius: '999px',
         background: '#fffefb', color: '#24221f', cursor: 'pointer', font: 'inherit', fontSize: '13px',
         boxShadow: '0 2px 10px rgba(0,0,0,.08)',
@@ -733,17 +734,32 @@ function createStudyPicker(options) {
     })
     root.addEventListener('click', open)
     document.body.append(root)
+    // 只在研究插件面板打开时显示；对话页不占用标题栏/正文空间。
+    const syncVisibility = () => {
+      let visible = false
+      try { visible = Boolean(document.querySelector('.so-pagehead,.sd-root,.dc-root,.ar-pagehead')) } catch { visible = false }
+      root.style.display = visible ? '' : 'none'
+      if (!visible && panel) close()
+    }
+    syncVisibility()
+    setInterval(syncVisibility, 800)
     refresh()
+    if (typeof window !== 'undefined') window.__DSH_RESEARCH_PICKER_INSTANCE__ = pickerApi
     return root
   }
 
-  return { install, open, close, refresh, get state() { return choices } }
+  const pickerApi = { install, open, close, refresh, get state() { return choices } }
+  return pickerApi
 }
 
 const DSH_RESEARCH_PICKER = { createStudyPicker }
   global.__DSH_RESEARCH_PICKER__ = DSH_RESEARCH_PICKER
 })(typeof window !== 'undefined' ? window : globalThis)
 /* @dsh-generated: study-picker prelude end */
+
+
+
+
 
 
 
@@ -1498,6 +1514,6 @@ window.__ModuleLoader__.load({
     }
     function Icon() { return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, 'aria-hidden': true }, h('rect', { x: 3, y: 3, width: 18, height: 18, rx: 3 }), h('path', { d: 'M3 9h18M9 9v12M13 16l2-3 3 2' })) }
     class Guard extends React.Component { constructor(p) { super(p); this.state = { error: null } } static getDerivedStateFromError(error) { return { error } } render() { return this.state.error ? h('div', { role: 'alert', style: { padding: 20, fontFamily: 'Cambria,"Noto Serif SC",serif', color: '#9b3a2c', background: '#f4dfd9' } }, '分析面板加载失败，请刷新后重试。 ', String(this.state.error.message)) : this.props.children } }
-    return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); try { const ui = ctx.get && ctx.get('uiWorkspace'); window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({ plugin: 'analysis-run', route: '/api/analysis-run', headers: () => headers(), pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null }).install() } catch (error) { console.warn('[analysis-run] study picker not installed', error) } ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
+    return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); try { const ui = (ctx.get && ctx.get('uiWorkspace')) || ctx.uiWorkspace; window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({ plugin: 'analysis-run', route: '/api/analysis-run', headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }), pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null }).install() } catch (error) { console.warn('[analysis-run] study picker not installed', error) } ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
   }
 })
