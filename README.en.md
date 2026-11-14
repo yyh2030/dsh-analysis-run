@@ -4,7 +4,7 @@
 
 A research plugin written for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): Analysis Runner. Pick a data file, complete a plan in a few clicks, run it into a run record with an input snapshot and an environment lock, then export it as an HTML/PDF report and three-line tables in Word/Excel.
 
-Version 0.3.0 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
+Version 0.5.2 · Requires DSH ≥ 0.2.2-rc.1 · MIT license · Depends on [`@local/research-core`](https://github.com/yyh2030/dsh-research-core)
 
 ## Why it exists
 
