@@ -1244,6 +1244,7 @@ window.__ModuleLoader__.load({
       const header = h('header', { className: 'ar-pagehead' },
         h('div', { className: 'ar-headtext' }, h('h1', null, '分析直通'), h('p', { className: 'ar-subtitle' }, (status?.study.name || '正在加载研究…') + (status?.mode === 'adapter' ? ' · 专用分析' : ' · 通用分析') + (status?.binding ? ' · ' + (sourceLabel[status.binding.source] || status.binding.source) + (status.binding.instanceId ? ' / 实例 ' + String(status.binding.instanceId).slice(0, 12) : '') : ''))),
         h('div', { className: 'ar-actions' },
+          h('button', { className: 'ar-btn ar-btn-quiet', onClick: openPickerFromButton }, '研究切换'),
           h('button', { className: 'ar-btn ar-btn-quiet', disabled: busy, onClick: () => load(runId) }, '刷新'),
           h('button', { className: 'ar-btn ar-btn-primary', disabled: blocked || !status || (status.mode === 'generic' && !plan?.dataPath), onClick: () => act('run', { stage: 'all', ...(status.mode === 'generic' ? { plan } : {}) }) }, blocked ? '分析进行中…' : '运行分析')))
       if (!status) return h('main', { className: 'ar-app' }, h('div', { className: 'ar-shell' }, header, error ? h('div', { className: 'ar-status ar-error', role: 'alert' }, error) : null, h('div', { className: 'ar-empty', role: 'status' }, h('strong', null, '正在加载分析方案…'), h('span', null, '读取研究、方案与运行记录后，这里会显示结果、方案和运行历史。'))))
@@ -1511,6 +1512,21 @@ window.__ModuleLoader__.load({
     }
     function Icon() { return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, 'aria-hidden': true }, h('rect', { x: 3, y: 3, width: 18, height: 18, rx: 3 }), h('path', { d: 'M3 9h18M9 9v12M13 16l2-3 3 2' })) }
     class Guard extends React.Component { constructor(p) { super(p); this.state = { error: null } } static getDerivedStateFromError(error) { return { error } } render() { return this.state.error ? h('div', { role: 'alert', style: { padding: 20, fontFamily: 'Cambria,"Noto Serif SC",serif', color: '#9b3a2c', background: '#f4dfd9' } }, '分析面板加载失败，请刷新后重试。 ', String(this.state.error.message)) : this.props.children } }
-    return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); try { const ui = (ctx.get && ctx.get('uiWorkspace')) || ctx.uiWorkspace; window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({ plugin: 'analysis-run', route: '/api/analysis-run', headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }), pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null }).install() } catch (error) { console.warn('[analysis-run] study picker not installed', error) } ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
+    function openPickerFromButton() {
+    try {
+      const ui = (hostCtx && hostCtx.get && hostCtx.get('uiWorkspace')) || (hostCtx && hostCtx.uiWorkspace)
+      const factory = window.__DSH_RESEARCH_PICKER__
+      if (!factory) throw new Error('共享选择器模块未加载')
+      const picker = factory.createStudyPicker({
+        plugin: 'analysis-run', route: '/api/analysis-run',
+        headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }),
+        pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null,
+      })
+      picker.install(); picker.open()
+    } catch (error) {
+      try { window.alert('研究选择器不可用：' + (error && error.message ? error.message : String(error))) } catch { /* 无窗口 */ }
+    }
+  }
+  return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); try { const ui = (ctx.get && ctx.get('uiWorkspace')) || ctx.uiWorkspace; window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({ plugin: 'analysis-run', route: '/api/analysis-run', headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }), pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null }).install() } catch (error) { console.warn('[analysis-run] study picker not installed', error) } ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
   }
 })
