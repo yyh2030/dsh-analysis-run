@@ -1531,11 +1531,11 @@ window.__ModuleLoader__.load({
         headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }),
         pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null,
       })
-      picker.install(); picker.open()
+      picker.open()
     } catch (error) {
       try { window.alert('研究选择器不可用：' + (error && error.message ? error.message : String(error))) } catch { /* 无窗口 */ }
     }
   }
-  return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); try { const ui = (ctx.get && ctx.get('uiWorkspace')) || ctx.uiWorkspace; window.__DSH_RESEARCH_PICKER__ && window.__DSH_RESEARCH_PICKER__.createStudyPicker({ plugin: 'analysis-run', route: '/api/analysis-run', headers: () => ({ 'x-analysis-run': '1', ...identity.headers() }), pickDirectory: ui && typeof ui.pickDirectory === 'function' ? () => ui.pickDirectory() : null }).install() } catch (error) { console.warn('[analysis-run] study picker not installed', error) } ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
+  return { inject: ['slots'], identity, apply(ctx) { hostCtx = ctx; ctx.effect(() => { const tag = document.createElement('style'); tag.textContent = CSS; document.head.appendChild(tag); return () => tag.remove() }, 'analysis-run styles'); ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'analysis-run', order: 33, label: '分析直通' }, () => h(Icon))); ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'analysis-run' }, () => h(Guard, null, h(Panel)))) } }
   }
 })
